@@ -133,3 +133,23 @@ test('permission rules are only echoed from the original remote suggestions afte
     assert.deepEqual(await pending,{behavior:'deny',message:'Please inspect the file first.'});
   } finally {await service.close();}
 });
+
+test('subagent steps stay under their tool; system events and resets become visible notices', () => {
+  const message = newAssistant('reply');
+  const t = new Transcript(message);
+  t.consume({ type: 'assistant', message: { id: 'm', content: [{ type: 'tool_use', id: 'task', name: 'Task', input: { description: 'look' } }] } });
+  t.consume({ type: 'assistant', parent_tool_use_id: 'task', message: { id: 'sub', content: [{ type: 'text', text: 'working' }, { type: 'tool_use', id: 'c1', name: 'Read', input: { file_path: '/a' } }] } });
+  t.consume({ type: 'user', parent_tool_use_id: 'task', message: { content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'data' }] } });
+  assert.equal(message.blocks.length, 1);
+  assert.deepEqual(message.blocks[0].children.map(child => [child.name, child.status, child.output]), [['Read', 'done', 'data']]);
+  t.consume({ type: 'tool_progress', tool_use_id: 'task', elapsed_time_seconds: 7 });
+  assert.equal(message.blocks[0].elapsed, 7);
+  t.consume({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 3, error_status: 529 });
+  assert.match(message.activity, /529/);
+  t.consume({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto', pre_tokens: 100, post_tokens: 10 } });
+  t.consume({ type: 'conversation_reset', new_conversation_id: 'n' });
+  assert.deepEqual(message.blocks.filter(block => block.type === 'notice').map(block => block.level), ['info', 'boundary']);
+  t.consume({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'task', content: [{ type: 'text', text: 'a' }, { type: 'image' }] }] } });
+  assert.equal(message.blocks[0].output, 'a\n[图片]');
+  assert.equal(message.activity, undefined);
+});

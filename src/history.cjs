@@ -1,9 +1,19 @@
-const fs = require('node:fs');
-const path = require('node:path');
-const { shellQuote, createSession } = require('./remote.cjs');
+const { createSession } = require('./remote.cjs');
+const { agentFor } = require('./agent-client.cjs');
 const { connectionKey } = require('./ssh.cjs');
 const { Transcript, newAssistant } = require('./transcript.cjs');
-const helper = fs.readFileSync(path.join(__dirname, 'remote-history.py'), 'utf8');
+
+// The CLI stores slash commands and their output inside XML-like tags.
+function userText(text) {
+  const command = /<command-name>([^<]*)<\/command-name>/.exec(text);
+  if (command) {
+    const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim();
+    return command[1].trim() + (args ? ' ' + args : '');
+  }
+  const output = /<local-command-stdout>([\s\S]*?)<\/local-command-stdout>/.exec(text);
+  if (output) return output[1].trim();
+  return text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '').trim();
+}
 
 function historyMessages(records) {
   const messages = [];
@@ -12,7 +22,7 @@ function historyMessages(records) {
     if (event.type === 'user') {
       const previous = messages.at(-1);
       if (previous?.role === 'assistant') new Transcript(previous).toolResults(event);
-      const text = blocks.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      const text = userText(blocks.filter(block => block.type === 'text').map(block => block.text).join('\n'));
       if (text) messages.push({ id: event.uuid, role: 'user', text, createdAt: Date.parse(event.timestamp) || 0 });
     } else {
       const message = newAssistant(event.uuid);
@@ -27,20 +37,7 @@ function historyMessages(records) {
 
 class RemoteHistory {
   constructor(connections, service) { this.connections = connections; this.service = service; this.pending = new Map(); }
-  async run(config, request) {
-    const command = 'python3 -c ' + shellQuote(helper) + ' ' + shellQuote(JSON.stringify(request));
-    const child = this.connections.spawn(config, 'bash -lc ' + shellQuote(command));
-    child.stdin.end();
-    let output = '', error = '';
-    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    const timer = setTimeout(() => { error = '读取历史超时'; child.kill(); }, 60000);
-    child.stdout.on('data', data => { output += data; if (output.length > 32 * 1024 * 1024) { error = '历史响应过大'; child.kill(); } });
-    child.stderr.on('data', data => { error = (error + data).slice(-4000); });
-    try {
-      await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', code => code === 0 ? resolve() : reject(new Error(error || '无法读取远端历史'))); });
-      return JSON.parse(output);
-    } finally { clearTimeout(timer); }
-  }
+  run(config, request) { return agentFor(this.connections).call(config, 'history', request); }
   async discover(config, offset = 0) {
     const result = await this.run(config, { operation: 'list', offset });
     const imported = [];

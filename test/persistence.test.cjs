@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { finalizeTask, ownerAlive } = require('../src/remote-agent.cjs');
 const { ChatService } = require('../src/chat-service.cjs');
 const { ChatStore } = require('../src/store.cjs');
 const { PersistentTasks } = require('../src/persistent-tasks.cjs');
@@ -37,19 +38,32 @@ test('restart reserves a detached task; repeated snapshots replace rather than d
 
 test('remote supervisor never re-executes a completed or uncertain task', () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remotecc-owner-unit-'));
-  const helper = path.resolve('src/task-bridge.py');
   try {
     const request = { session: { messages: [{ id: 'reply', blocks: [] }] } };
     fs.writeFileSync(path.join(folder, 'request.json'), JSON.stringify(request));
     fs.writeFileSync(path.join(folder, 'started.json'), 'true');
-    let result = spawnSync('python3', [helper, 'supervise', folder, '/nonexistent'], { encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stderr);
+    assert.equal(ownerAlive(folder), false);
+    finalizeTask(folder);
     const state = JSON.parse(fs.readFileSync(path.join(folder, 'state.json')));
     assert.equal(state.done, true); assert.equal(state.status, 'error');
-    result = spawnSync('python3', [helper, 'supervise', folder, '/nonexistent'], { encoding: 'utf8' });
-    assert.equal(result.status, 0, result.stderr);
+    finalizeTask(folder);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(folder, 'state.json'))), state);
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
+
+test('a live owner process is not finalized; a dead one reports instead of re-executing', () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remotecc-owner-live-'));
+  const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', 'remote-agent'], { stdio: 'ignore' });
+  try {
+    fs.writeFileSync(path.join(folder, 'started.json'), JSON.stringify({ pid: child.pid }));
+    assert.equal(ownerAlive(folder), true);
+    fs.writeFileSync(path.join(folder, 'state.json'), JSON.stringify({ version: 1, resident: true, status: 'working', message: { id: 'm', blocks: [] } }));
+    child.kill('SIGKILL');
+    spawnSync('sleep', ['0.2']);
+    assert.equal(ownerAlive(folder), false);
+    const state = finalizeTask(folder);
+    assert.equal(state.status, 'error'); assert.equal(state.version, 2); assert.match(state.message.error, /未自动重新执行/);
+  } finally { child.kill('SIGKILL'); fs.rmSync(folder, { recursive: true, force: true }); }
 });
 
 test('resident idle snapshots keep owner and command catalogue; old turn snapshots cannot overwrite a new turn', async () => {

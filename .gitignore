@@ -9,3 +9,8 @@ __pycache__/
 .env.*
 !.env.example
 *.log
+
+# Swift client build output and generated server resources
+macos/.build/
+macos/dist/
+macos/Resources/server/

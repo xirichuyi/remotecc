@@ -84,8 +84,10 @@ async function control(command) {
   if (command.kind === 'close') { input.close(); query.close(); return {}; }
   throw new Error('未知会话请求');
 }
+let rerun = false;
 async function commands() {
-  if (handling || !query) return;
+  if (!query) return;
+  if (handling) { rerun = true; return; }
   handling = true;
   try {
     for (const name of fs.readdirSync(path.join(folder, 'commands')).sort()) {
@@ -101,10 +103,15 @@ async function commands() {
       fs.renameSync(filename, filename + '.done');
     }
   } finally { handling = false; }
+  if (rerun) { rerun = false; return commands(); }
 }
 session.preferences ||= {};
 snapshot();
-const timer = setInterval(() => commands().catch(error => console.error(error.message)), 100);
+const runCommands = () => commands().catch(error => console.error(error.message));
+// fs.watch makes stop and approvals immediate; the interval covers filesystems without inotify.
+const timer = setInterval(runCommands, 1000);
+let commandWatcher;
+try { commandWatcher = fs.watch(path.join(folder, 'commands'), runCommands); commandWatcher.on('error', () => {}); } catch { /* Interval only. */ }
 (async () => {
   const { query: createQuery } = await import(pathToFileURL(path.join(__dirname, 'sdk.mjs')).href);
   query = createQuery({ prompt: input, options: service.options(session, run) }); run.query = query;
@@ -122,7 +129,7 @@ const timer = setInterval(() => commands().catch(error => console.error(error.me
   run.message.error = [error.message, run.stderr].filter(Boolean).join('\n');
   session.status = 'error';
 }).finally(() => {
-  ended = true; clearInterval(timer); input.close(); query?.close();
+  ended = true; clearInterval(timer); commandWatcher?.close(); input.close(); query?.close();
   if (service.runs.has(session.id)) service.finish(session, run, true);
   for (const pending of service.timers.values()) clearTimeout(pending);
   snapshot();

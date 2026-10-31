@@ -2,15 +2,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { gzipSync } = require('node:zlib');
-const readline = require('node:readline');
 const { applyStateDelta } = require('./state-delta.cjs');
 const { connectionKey } = require('./ssh.cjs');
-const { shellQuote } = require('./remote.cjs');
-const bridge = fs.readFileSync(path.join(__dirname, 'task-bridge.py'), 'utf8');
+const { agentFor } = require('./agent-client.cjs');
 
 function taskBundle() {
   const files = {};
-  for (const name of ['task-worker.cjs', 'task-bridge.py', 'chat-service.cjs', 'remote.cjs', 'transcript.cjs', 'capabilities.cjs', 'interaction-schema.js', 'session-input.cjs'])
+  for (const name of ['task-worker.cjs', 'task-inspect.cjs', 'chat-service.cjs', 'remote.cjs', 'transcript.cjs', 'capabilities.cjs', 'interaction-schema.js', 'session-input.cjs'])
     files[name] = fs.readFileSync(path.join(__dirname, name), 'utf8');
   files['sdk.mjs'] = fs.readFileSync(require.resolve('@anthropic-ai/claude-agent-sdk'), 'utf8');
   const data = Buffer.from(JSON.stringify(files));
@@ -27,29 +25,7 @@ class PersistentTasks {
     this.pending = new Map();
   }
 
-  process(session, request) {
-    const command = 'bash -lc ' + shellQuote('python3 -c ' + shellQuote(bridge));
-    const child = this.connections.spawn(session, command);
-    child.stdin.on('error', () => {}); // Exit/error is reported through the process result.
-    child.stdin.end(JSON.stringify(request));
-    return child;
-  }
-
-  async call(session, request) {
-    const child = this.process(session, request);
-    let output = '', error = '';
-    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
-    child.stdout.on('data', chunk => { output += chunk; if (output.length > 32 * 1024 * 1024) child.kill(); });
-    child.stderr.on('data', chunk => { error = (error + chunk).slice(-6000); });
-    const timer = setTimeout(() => child.kill(), 60000);
-    try {
-      await new Promise((resolve, reject) => {
-        child.once('error', reject);
-        child.once('close', code => code === 0 ? resolve() : reject(new Error(error || '远端任务连接中断，请重新连接 SSH')));
-      });
-      return JSON.parse(output);
-    } finally { clearTimeout(timer); }
-  }
+  call(session, request) { return agentFor(this.connections).call(session, 'task', request); }
 
   async install(session) {
     const key = connectionKey(session);
@@ -116,26 +92,23 @@ class PersistentTasks {
 
   watch(session) {
     const taskId = (session.remoteOwner || session.remoteTask).id;
-    const child = this.process(session, { operation: 'watch', taskId });
-    this.watchers.set(session.id, child);
-    const lines = readline.createInterface({ input: child.stdout });
-    let error = '', previous = null;
-    child.stderr.on('data', chunk => { error = (error + chunk).slice(-2000); });
-    lines.on('line', line => {
-      if (this.watchers.get(session.id) !== child || (session.remoteOwner || session.remoteTask)?.id !== taskId) return;
-      try {
-        const packet = JSON.parse(line);
-        if (!packet.heartbeat) { previous = applyStateDelta(previous, packet); this.apply(session, previous); }
-      }
-      catch (failure) { error = failure.message; child.kill(); }
-    });
-    child.on('error', failure => { error = failure.message; });
-    child.on('close', () => {
-      lines.close();
-      if (this.watchers.get(session.id) !== child) return;
+    let previous = null, error = '';
+    const entry = { kill() { this.killed = true; this.subscription?.kill(); } };
+    this.watchers.set(session.id, entry);
+    const ended = reason => {
+      if (this.watchers.get(session.id) !== entry) return;
       this.watchers.delete(session.id);
-      if ((session.remoteOwner || session.remoteTask)?.id === taskId) this.detached(session, error);
-    });
+      if ((session.remoteOwner || session.remoteTask)?.id === taskId) this.detached(session, error || reason);
+    };
+    const packet = value => {
+      if (this.watchers.get(session.id) !== entry || (session.remoteOwner || session.remoteTask)?.id !== taskId) return;
+      try { if (!value.heartbeat) { previous = applyStateDelta(previous, value); this.apply(session, previous); } }
+      catch (failure) { error = failure.message; entry.kill(); ended(error); }
+    };
+    return agentFor(this.connections).subscribe(session, { taskId }, packet, ended).then(subscription => {
+      entry.subscription = subscription;
+      if (entry.killed) subscription.kill();
+    }, failure => ended(failure.message));
   }
 
   apply(session, state) {

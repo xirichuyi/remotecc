@@ -37,7 +37,7 @@ class ChatService extends EventEmitter {
       this.store.save(this.sessions, session);
       this.emit('changed', session);
     } else if (!this.timers.has(session.id)) {
-      this.timers.set(session.id, setTimeout(() => this.changed(session, true), 100));
+      this.timers.set(session.id, setTimeout(() => this.changed(session, true), 50));
     }
   }
 
@@ -333,8 +333,11 @@ class ChatService extends EventEmitter {
     for (const permission of [...session.permissions]) this.respond(session.id, permission.id, { allow: false });
     if (!keepQuery) run.query?.close();
     if (run.stopped) run.message.interrupted = true;
+    delete run.message.activity;
     for (const block of run.message.blocks) {
-      if (block.type === 'tool' && block.status === 'running') block.status = run.stopped ? 'stopped' : 'done';
+      if (block.type !== 'tool') continue;
+      for (const tool of [block, ...(block.children || [])]) if (tool.status === 'running') tool.status = run.stopped ? 'stopped' : 'done';
+      delete block.elapsed;
     }
     session.status = run.stopped ? 'stopped' : run.message.error ? 'error' : 'idle';
     this.runs.delete(session.id);

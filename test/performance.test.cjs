@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { stateDelta } = require('../src/remote-agent.cjs');
 const { applyStateDelta } = require('../src/state-delta.cjs');
 const { ChatStore } = require('../src/store.cjs');
 const { createSession } = require('../src/remote.cjs');
@@ -15,10 +15,7 @@ test('remote deltas reconstruct text, tools, removed fields and permissions; out
     { version:2, done:false, permissions:[{id:'p'}], message:{id:'m',blocks:[{type:'text',text:'hello world'},{type:'tool',input:{x:1}}]} },
     { version:3, done:true, permissions:[], message:{id:'m',blocks:[{type:'text',text:'replaced'},{type:'tool',input:{x:2}}]} },
   ];
-  const script = `import importlib.util,json,sys\ns=importlib.util.spec_from_file_location('bridge','src/task-bridge.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\na=json.load(sys.stdin)\nprint(json.dumps([dict(delta=True,base=a[i-1]['version'],version=a[i]['version'],patches=m.state_delta(a[i-1],a[i])) for i in range(1,len(a))]))`;
-  const result = spawnSync('python3',['-c',script],{input:JSON.stringify(states),encoding:'utf8'});
-  assert.equal(result.status,0,result.stderr);
-  const packets=JSON.parse(result.stdout);
+  const packets=states.slice(1).map((value,i)=>({delta:true,base:states[i].version,version:value.version,patches:stateDelta(states[i],value)}));
   let state=states[0]; packets.forEach((packet,i)=>{state=applyStateDelta(state,packet);assert.deepEqual(state,states[i+1]);});
   assert.equal(states[0].message.blocks[0].text,'hello');
   assert.throws(()=>applyStateDelta(state,packets[0]),/不连续/);

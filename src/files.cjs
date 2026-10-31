@@ -7,8 +7,7 @@ const { FileCache } = require('./file-cache.cjs');
 const { randomUUID } = require('node:crypto');
 const { pipeline } = require('node:stream/promises');
 const { Transform } = require('node:stream');
-const { shellQuote } = require('./remote.cjs');
-const helper = fs.readFileSync(path.join(__dirname, 'remote-files.py'), 'utf8');
+const { agentFor } = require('./agent-client.cjs');
 
 class RemoteFiles {
   constructor(connections, progress = () => {}, cacheDirectory = path.join(os.tmpdir(), 'remotecc-file-cache')) {
@@ -34,14 +33,18 @@ class RemoteFiles {
   }
   run(session, request, transfer = {}) {
     const signal = this.context.getStore()?.signal;
+    if (!transfer.input && !transfer.output) {
+      // Small requests multiplex over the persistent agent channel; no scheduling slot is needed.
+      return agentFor(this.connections).call(session, 'file', { base: session.directory, ...request, ...(transfer.data !== undefined ? { data: transfer.data } : {}) }, { signal, timeout: 45000 });
+    }
     const host = JSON.stringify([session.host, session.port || '']);
-    const priority = ['save', 'upload'].includes(request.operation) ? 1 : 0;
+    const priority = request.operation === 'upload' ? 1 : 0;
     return this.scheduler.run(host, () => this.execute(session, request, transfer, signal), signal, priority);
   }
   async execute(session, request, transfer = {}, signal) {
     if (signal?.aborted) throw new Error('请求已取消');
-    const command = 'python3 -c ' + shellQuote(helper) + ' ' + shellQuote(JSON.stringify({ base: session.directory, ...request }));
-    const child = this.connections.spawn(session, command);
+    const child = await agentFor(this.connections).spawnTransfer(session, { base: session.directory, ...request });
+    if (signal?.aborted) { child.kill(); throw new Error('请求已取消'); }
     const cancel = () => child.kill();
     signal?.addEventListener('abort', cancel, { once: true });
     let stderr = '';
@@ -49,7 +52,7 @@ class RemoteFiles {
     let timedOut = false;
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', data => { stderr = (stderr + data).slice(-8000); });
-    const timeout = setTimeout(() => { timedOut = true; child.kill(); }, transfer.input || transfer.output ? 15 * 60000 : 45000);
+    const timeout = setTimeout(() => { timedOut = true; child.kill(); }, 15 * 60000);
     const ended = new Promise((resolve, reject) => {
       child.once('error', reject);
       child.once('close', code => code === 0 ? resolve() : reject(new Error(timedOut ? '传输超时' : stderr.trim() || 'SSH 文件操作失败')));
@@ -66,16 +69,11 @@ class RemoteFiles {
     } });
     const jobs = [ended];
     if (transfer.input) jobs.push(pipeline(fs.createReadStream(transfer.input), counter, child.stdin));
-    else if (transfer.data !== undefined) {
-      jobs.push(new Promise((resolve, reject) => { child.stdin.on('error', reject); child.stdin.end(transfer.data, resolve); }));
-    } else child.stdin.end();
+    else child.stdin.end();
     if (transfer.output) jobs.push(pipeline(child.stdout, counter, fs.createWriteStream(transfer.output, { flags: 'wx', mode: 0o600 })));
     else {
       child.stdout.setEncoding('utf8');
-      child.stdout.on('data', data => {
-        output += data;
-        if (output.length > 32 * 1024 * 1024) { stderr = '返回数据超过限制'; child.kill(); }
-      });
+      child.stdout.on('data', data => { output += data; });
     }
     try {
       await Promise.all(jobs);

@@ -4,7 +4,8 @@ const busyStates = new Set(['connecting', 'working', 'permission', 'stopping', '
 const statusLabels = { detached: '远端任务待同步', idle: '就绪', connecting: '连接中', working: '正在回复', permission: '等待你的确认', stopping: '正在停止', stopped: '已停止', error: '调用未完成' };
 let sessions = [];
 let activeId = null;
-let defaults = { host: 'axi', directory: '~' };
+let defaults = { host: '', directory: '~' };
+try { Object.assign(defaults, JSON.parse(localStorage.getItem('last-connection') || '{}')); } catch { /* Ignore a corrupt saved connection. */ }
 let toastTimer;
 let permissionSignature = '';
 let submitting = false;
@@ -42,48 +43,121 @@ function copyText(text, button) {
   }).catch(showError);
 }
 
-function textBlock(text) {
+const remotePathPattern = /^(\/|~\/|\.\.?\/)[^\n]+$|^[\w.@-]+(\/[\w.@-]+)+$|^[\w.@-]+\.(js|cjs|mjs|ts|tsx|jsx|py|go|rs|java|c|h|cpp|cs|rb|php|sh|md|txt|json|yaml|yml|toml|html|css|sql|csv|png|jpg|jpeg|gif|webp|pdf|log)$/i;
+function highlightCode(code) {
+  const language = /language-([\w-]+)/.exec(code.className)?.[1];
+  if (window.hljs && language && hljs.getLanguage(language) && code.textContent.length < 100000) hljs.highlightElement(code);
+}
+function textBlock(text, highlight = true) {
   const element = document.createElement('div');
   element.className = 'markdown';
   element.innerHTML = markdown(text);
   for (const pre of element.querySelectorAll('pre')) {
+    const code = pre.querySelector('code');
+    if (highlight && code) highlightCode(code);
     const button = document.createElement('button');
     button.className = 'code-copy';
     button.textContent = '复制代码';
-    button.onclick = () => copyText(pre.querySelector('code')?.textContent || '', button);
+    button.onclick = () => copyText(code?.textContent || '', button);
     pre.append(button);
   }
-  for (const code of element.querySelectorAll('p > code, li > code')) {
-    const file = code.textContent;
-    if (/^(\/|~\/|\.\.?\/)[^\n]+$/.test(file)) {
+  for (const code of element.querySelectorAll('p > code, li > code, td > code')) {
+    const located = /^(.+?)(?::(\d+))?(?::\d+)?$/.exec(code.textContent);
+    if (located && remotePathPattern.test(located[1])) {
       const button = document.createElement('button');
       button.className = 'remote-file-link';
-      button.textContent = file;
-      button.onclick = () => window.openRemotePreview(file);
+      button.textContent = code.textContent;
+      button.onclick = () => window.openRemotePreview(located[1], located[2] ? Number(located[2]) : undefined);
       code.replaceWith(button);
     }
   }
   return element;
 }
+window.renderMarkdownBlock = text => textBlock(text);
 
-function toolBlock(block, openTools) {
-  const details = document.createElement('details');
-  details.className = 'tool-card';
-  details.dataset.toolId = block.id;
-  details.open = openTools.has(block.id);
-  const summary = document.createElement('summary');
-  const status = document.createElement('span');
-  status.textContent = { history: '历史记录', running: '执行中', done: '已完成', error: '执行失败', stopped: '已停止' }[block.status] || '';
-  summary.append(document.createTextNode(block.name), status);
-  const input = document.createElement('pre');
-  input.textContent = JSON.stringify(block.input, null, 2);
-  details.append(summary, input);
-  if (block.output) {
-    const output = document.createElement('pre');
-    output.textContent = block.output;
-    details.append(output);
+function contentBlock(block, message, index, openTools, streaming) {
+  if (block.type === 'text' && block.text) return textBlock(block.text, !streaming);
+  if (block.type === 'thinking' && block.text) {
+    const details = document.createElement('details'); details.className = 'thinking-card';
+    details.dataset.toolId = 'thinking-' + message.id + '-' + index;
+    details.open = openTools.has(details.dataset.toolId);
+    const summary = document.createElement('summary'); summary.textContent = '思考过程';
+    const content = document.createElement('pre'); content.textContent = block.text;
+    details.append(summary, content);
+    return details;
   }
-  return details;
+  if (block.type === 'tool') return window.renderToolBlock(block, openTools);
+  if (block.type === 'notice') {
+    const notice = document.createElement('div');
+    notice.className = 'system-notice ' + (block.level || 'info');
+    notice.textContent = block.text;
+    return notice;
+  }
+  const empty = document.createElement('span'); empty.hidden = true;
+  return empty;
+}
+
+function messageFooter(message, busy) {
+  const footer = document.createElement('div');
+  footer.className = 'message-footer';
+  if (message.error) {
+    const error = document.createElement('div');
+    error.className = 'message-error';
+    error.textContent = message.error;
+    footer.append(error);
+  }
+  if (busy && !message.error) {
+    const indicator = document.createElement('div');
+    indicator.className = 'typing';
+    indicator.setAttribute('aria-label', 'Claude 正在回复');
+    indicator.innerHTML = '<span></span><span></span><span></span>';
+    footer.append(indicator);
+  }
+  if (message.interrupted) {
+    const note = document.createElement('div');
+    note.className = 'interrupted';
+    note.textContent = '已停止生成 · 可以发送下一条消息继续';
+    footer.append(note);
+  }
+  const text = message.blocks.filter(block => block.type === 'text').map(block => block.text).join('\n\n');
+  if (!busy && (text || message.durationMs)) {
+    const row = document.createElement('div'); row.className = 'message-meta';
+    if (text) {
+      const copy = document.createElement('button');
+      copy.className = 'copy-message';
+      copy.textContent = '复制回复';
+      copy.onclick = () => copyText(text, copy);
+      row.append(copy);
+    }
+    const parts = [message.model, message.durationMs ? (message.durationMs / 1000).toFixed(1) + 's' : '', message.costUSD ? '$' + message.costUSD.toFixed(4) : ''].filter(Boolean);
+    if (parts.length) { const info = document.createElement('span'); info.textContent = parts.join(' · '); row.append(info); }
+    footer.append(row);
+  }
+  return footer;
+}
+
+// Only blocks whose content changed are rebuilt, so streaming never re-parses the whole reply.
+function updateMessageBody(body, message, busy) {
+  const openTools = new Set();
+  for (const item of body.querySelectorAll(':scope > details')) {
+    if (item.open) openTools.add(item.dataset.toolId);
+    else openTools.add('closed:' + item.dataset.toolId);
+  }
+  const previous = body._blocks || [];
+  const nodes = message.blocks.map((block, index) => {
+    const streaming = busy && index === message.blocks.length - 1;
+    const signature = JSON.stringify(block) + streaming;
+    if (previous[index]?.signature === signature) return previous[index];
+    const node = contentBlock(block, message, index, openTools, streaming);
+    if (previous[index]) previous[index].node.replaceWith(node);
+    return { signature, node };
+  });
+  for (const stale of previous.slice(nodes.length)) stale.node.remove();
+  for (const entry of nodes) if (!entry.node.parentNode) body.append(entry.node);
+  body._blocks = nodes;
+  body._footer?.remove();
+  body._footer = messageFooter(message, busy);
+  body.append(body._footer);
 }
 
 function messageElement(message, busy) {
@@ -107,46 +181,7 @@ function messageElement(message, busy) {
   heading.innerHTML = '<span class="assistant-symbol">✳</span><span>Claude</span><small>REMOTE</small>';
   const body = document.createElement('div');
   body.className = 'message-body';
-  const openTools = new Set([...$('#messages').querySelectorAll('details[open]')].map(item => item.dataset.toolId));
-  for (const block of message.blocks) {
-    if (block.type === 'text' && block.text) body.append(textBlock(block.text));
-    if (block.type === 'thinking' && block.text) {
-      const details = document.createElement('details'); details.className = 'thinking-card';
-      details.dataset.toolId = 'thinking-' + message.id + '-' + message.blocks.indexOf(block);
-      details.open = openTools.has(details.dataset.toolId);
-      const summary = document.createElement('summary'); summary.textContent = '思考过程';
-      const content = document.createElement('pre'); content.textContent = block.text;
-      details.append(summary, content); body.append(details);
-    }
-    if (block.type === 'tool') body.append(toolBlock(block, openTools));
-  }
-  if (message.error) {
-    const error = document.createElement('div');
-    error.className = 'message-error';
-    error.textContent = message.error;
-    body.append(error);
-  }
-  if (busy && !message.error) {
-    const indicator = document.createElement('div');
-    indicator.className = 'typing';
-    indicator.setAttribute('aria-label', 'Claude 正在回复');
-    indicator.innerHTML = '<span></span><span></span><span></span>';
-    body.append(indicator);
-  }
-  if (message.interrupted) {
-    const note = document.createElement('div');
-    note.className = 'interrupted';
-    note.textContent = '已停止生成 · 可以发送下一条消息继续';
-    body.append(note);
-  }
-  const text = message.blocks.filter(block => block.type === 'text').map(block => block.text).join('\n\n');
-  if (text && !busy) {
-    const copy = document.createElement('button');
-    copy.className = 'copy-message';
-    copy.textContent = '复制回复';
-    copy.onclick = () => copyText(text, copy);
-    body.append(copy);
-  }
+  updateMessageBody(body, message, busy);
   article.append(heading, body);
   return article;
 }
@@ -162,10 +197,14 @@ function renderMessages(session) {
     if (index < messages.length - 1 && cached?.message === message && cached.busy === busy) continue;
     const signature = JSON.stringify(message) + busy;
     if (renderedMessages.get(message.id)?.signature === signature) continue;
-    const element = messageElement(message, busy);
     const previous = renderedMessages.get(message.id)?.element;
-    if (previous) previous.replaceWith(element);
-    else $('#messages').insertBefore(element, $('#messages').children[index] || null);
+    let element = previous;
+    if (previous && message.role === 'assistant') updateMessageBody(previous.querySelector('.message-body'), message, busy);
+    else {
+      element = messageElement(message, busy);
+      if (previous) previous.replaceWith(element);
+      else $('#messages').insertBefore(element, $('#messages').children[index] || null);
+    }
     renderedMessages.set(message.id, { signature, element, message, busy });
   }
   if (atBottom) requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
@@ -308,7 +347,7 @@ function renderPermissions(session) {
     const card = document.createElement('section');
     card.className = 'permission-card';
     const title = document.createElement('h3');
-    title.textContent = permission.name === 'AskUserQuestion' ? 'Claude 想确认一下' : permission.title;
+    title.textContent = permission.name === 'AskUserQuestion' ? 'Claude 想确认一下' : permission.name === 'ExitPlanMode' ? 'Claude 的计划，确认后开始执行' : permission.title;
     card.append(title);
     if (permission.description) {
       const description = document.createElement('p');
@@ -316,11 +355,7 @@ function renderPermissions(session) {
       card.append(description);
     }
     if (permission.name === 'AskUserQuestion') card.append(questionFields(permission));
-    else {
-      const input = document.createElement('pre');
-      input.textContent = JSON.stringify(permission.input, null, 2);
-      card.append(input);
-    }
+    else card.append(window.renderToolRequest(permission.name, permission.input));
     let suggested;
     if (permission.suggestions?.length) {
       const details = document.createElement('details');
@@ -365,8 +400,8 @@ function updateUI() {
   const busy = busyStates.has(session?.status);
   $('#chat-title').textContent = session?.name || '新对话';
   $('#header-host').textContent = connection.host;
-  $('#sidebar-host').textContent = connection.host;
-  $('#workspace-label').textContent = connection.host;
+  $('#sidebar-host').textContent = connection.host || '未配置服务器';
+  $('#workspace-label').textContent = connection.host || '未连接';
   $('#workspace-directory').textContent = connection.directory;
   $('#workspace-directory').title = connection.directory;
   const selectedModel = session?.preferences?.selectedModel;
@@ -376,7 +411,7 @@ function updateUI() {
   $('#mode-label').textContent = { default: '默认权限', plan: '计划', acceptEdits: '自动编辑', dontAsk: '拒绝未授权', auto: '自动权限' }[session?.preferences?.permissionMode || 'default'];
   $('#connection-status').textContent = statusLabels[session?.status || 'idle'];
   $('#connection-status').title = session?.transportError || '';
-  $('#activity-text').textContent = session?.status === 'detached' ? '重新连接 SSH 后同步远端任务' : busy ? statusLabels[session.status] + ' · Enter 排队' : 'Enter 发送 · Shift + Enter 换行';
+  $('#activity-text').textContent = session?.status === 'detached' ? '重新连接 SSH 后同步远端任务' : busy ? (window.currentActivity(session) || statusLabels[session.status]) + ' · Enter 排队' : 'Enter 发送 · Shift + Enter 换行';
   $('#send-message').hidden = false;
   $('#send-message').title = busy ? '排队，当前回复完成后发送' : '发送消息';
   $('#send-message').setAttribute('aria-label', busy ? '加入队列' : '发送消息');
@@ -386,9 +421,10 @@ function updateUI() {
   $('#delete-chat').hidden = !session;
   $('#delete-chat').disabled = busy;
   $('#rename-chat').hidden = !session;
-  $('#welcome-path').textContent = connection.host + ' · ' + connection.directory;
+  $('#welcome-path').textContent = connection.host ? connection.host + ' · ' + connection.directory : '点击左下角「连接 SSH」连接你的服务器';
   renderMessages(session);
   renderPermissions(session);
+  window.renderTodoStrip(session);
   window.renderQueue?.(session);
   window.renderHistoryNotice?.(session);
 }
@@ -519,14 +555,28 @@ api.onChanged(session => {
     });
     sessions[index] = session;
   }
-  renderList();
-  if (session.id === activeId) updateUI();
+  scheduleRender(session.id === activeId);
 });
-api.list().then(result => {
+// Several packets can arrive per frame while streaming; draw once.
+let renderQueued = false, renderActive = false;
+function scheduleRender(active) {
+  renderActive ||= active;
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const update = renderActive; renderActive = false;
+    renderList();
+    if (update) updateUI();
+  });
+}
+// Later scripts install the file panel and controls; wait for them before the first selection.
+document.addEventListener('DOMContentLoaded', () => api.list().then(result => {
   sessions = result;
   if (sessions.length) defaults = { host: sessions[0].host, directory: sessions[0].directory, port: sessions[0].port };
   selectSession(sessions[0]?.id || null);
-}).catch(showError);
+  window.autoConnect?.();
+}).catch(showError));
 
 function setArchiveView(value) {
   showArchived = value;

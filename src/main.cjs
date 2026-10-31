@@ -11,6 +11,7 @@ const { SSHConnections, connectionKey } = require('./ssh.cjs');
 const { RemoteFiles } = require('./files.cjs');
 const { PersistentTasks } = require('./persistent-tasks.cjs');
 const { RemoteHistory } = require('./history.cjs');
+const { agentFor } = require('./agent-client.cjs');
 const { remoteCommand, validateSession } = require('./remote.cjs');
 
 let window;
@@ -82,7 +83,7 @@ function registerHandlers() {
     const config = validateSession(input);
     await connections.connect(config);
     const info = await files.run(config, { operation: 'hello' });
-    await service.persistent?.restore(config);
+    void service.persistent?.restore(config)?.catch(error => notify('ssh:recovery-error', error.message));
     return { ...connections.state(config), ...info, host: config.host, port: config.port };
   });
   handle('ssh:tunnels', id => connections.tunnels(service.get(id)));
@@ -92,10 +93,36 @@ function registerHandlers() {
     const active = [...service.runs.keys()].some(id => connectionKey(service.get(id)) === connectionKey(input));
     if (active && !service.persistent) throw new Error('请先停止此服务器上的回复，再断开 SSH');
     await service.persistent?.detach(input);
+    agentFor(connections).close(input);
     await connections.disconnect(input);
   });
   handle('files:list', (id, folder, hidden, force) => files.latest('list', () => files.list(service.get(id), folder, hidden === true, force === true)));
-  handle('files:cancel', kind => { if (['list', 'preview'].includes(kind)) files.cancel(kind); });
+  // Expanded tree folders load side by side, so these do not cancel one another.
+  handle('files:list-dir', (id, folder, hidden, force) => files.list(service.get(id), folder, hidden === true, force === true));
+  handle('files:refresh', (id, file) => files.preview(service.get(id), file));
+  handle('files:watch', (id, directories) => {
+    if (!Array.isArray(directories) || directories.some(item => typeof item !== 'string')) throw new Error('无效目录');
+    return agentFor(connections).call(service.get(id), 'watchDirectories', { directories });
+  });
+  handle('files:search', (id, query) => {
+    if (typeof query !== 'string' || query.length > 500) throw new Error('无效搜索内容');
+    return files.latest('search', () => files.run(service.get(id), { operation: 'search', query }));
+  });
+  handle('files:git-status', id => files.run(service.get(id), { operation: 'gitStatus' }));
+  handle('files:git-diff', (id, file) => files.run(service.get(id), { operation: 'gitFileDiff', path: file }));
+  handle('files:create', async (id, directory, name, folder) => {
+    try { return await files.run(service.get(id), { operation: 'create', directory, name, folder: folder === true }); }
+    finally { files.invalidate(); }
+  });
+  handle('files:rename', async (id, file, name) => {
+    try { return await files.run(service.get(id), { operation: 'rename', path: file, name }); }
+    finally { files.invalidate(); }
+  });
+  handle('files:remove', async (id, file, recursive) => {
+    try { return await files.run(service.get(id), { operation: 'remove', path: file, recursive: recursive === true }); }
+    finally { files.invalidate(); }
+  });
+  handle('files:cancel', kind => { if (['list', 'preview', 'search', 'suggest'].includes(kind)) files.cancel(kind); });
   handle('files:save', (id, file, text, revision) => files.save(service.get(id), file, text, revision));
   handle('files:diff', id => files.run(service.get(id), { operation: 'diff' }));
   handle('files:preview', (id, file) => files.latest('preview', () => files.preview(service.get(id), file)));
@@ -122,7 +149,7 @@ function registerHandlers() {
   });
   handle('files:suggest', (id, query) => {
     if (typeof query !== 'string' || query.length > 200) throw new Error('无效文件查询');
-    return files.run(service.get(id), { operation: 'suggest', query });
+    return files.latest('suggest', () => files.run(service.get(id), { operation: 'suggest', query }));
   });
   handle('files:download', downloadFile);
   handle('files:open', openLocalFile);
@@ -140,6 +167,7 @@ function registerHandlers() {
     if (!['https:', 'http:'].includes(parsed.protocol)) throw new Error('不支持的链接');
     return shell.openExternal(parsed.href);
   });
+  agentFor(connections).on('fs', event => { files.invalidate(); notify('files:changed', event); });
   service.on('changed', session => notify('chat:changed', sessionUpdates.packet(session)));
   connections.on('state', state => {
     if (state.status === 'connected') service.capabilityCache.clear();
