@@ -1,0 +1,40 @@
+{
+  "name": "remotecc",
+  "version": "0.13.1",
+  "description": "SSH workspace and chat client for remote Claude Code",
+  "main": "src/main.cjs",
+  "author": "RemoteCC",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "postinstall": "electron-builder install-app-deps",
+    "pack": "electron-builder --mac dir"
+  },
+  "build": {
+    "appId": "local.remotecc.desktop",
+    "productName": "RemoteCC",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "!node_modules/@anthropic-ai/claude-agent-sdk-darwin-*/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "identity": null
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.312",
+    "dompurify": "^3.4.17",
+    "marked": "^18.1.2"
+  },
+  "devDependencies": {
+    "electron": "^45.1.0",
+    "electron-builder": "^26.18.0",
+    "playwright": "^1.64.1"
+  }
+}

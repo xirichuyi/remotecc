@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.DS_Store
+
+# Local caches, credentials and runtime data
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log

@@ -1,0 +1,10 @@
+Agentbox — Copyright 2026 Agentbox contributors
+https://github.com/devilcoolyue/agentbox
+Reference revision: e19df41f1383fe5ef233473a51d148f9c99d27fd
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+RemoteCC adapts the command-token completion behavior from
+web/src/features/chat/commands.ts in src/command-completion.js and
+src/controls.js. The implementation has been rewritten for RemoteCC's
+Electron renderer, remote catalogue, persistent SDK session, and IPC.
+The original copyright notice is preserved in UPSTREAM-NOTICE.
