@@ -23,7 +23,7 @@ async function command(connections, session, script) {
   const files = new RemoteFiles(connections);
   const local = fs.mkdtempSync(path.join(os.tmpdir(), 'remotecc-files-test-'));
   const session = { id: 'file-test-session', host: process.env.REMOTECC_TEST_HOST || 'axi', directory: '~' };
-  let folder;
+  let folder, worktree;
   try {
     await connections.connect(session);
     console.log('SSH connected');
@@ -42,7 +42,7 @@ async function command(connections, session, script) {
     const uploaded = await files.upload(session, path.join(local, filename), folder);
     assert.equal(uploaded.path, folder + '/' + filename);
     assert.equal(uploaded.size, Buffer.byteLength(contents));
-    await assert.rejects(() => files.upload(session, path.join(local, filename), folder), /exist/i);
+    await assert.rejects(() => files.upload(session, path.join(local, filename), folder), /exist|已存在/i);
     const listing = await files.list(session, folder);
     assert.equal(listing.entries.length, 1);
     const preview = await files.preview(session, uploaded.path);
@@ -65,6 +65,20 @@ async function command(connections, session, script) {
     assert.deepEqual(Buffer.from(image.data, 'base64'), png);
     await assert.rejects(() => files.preview(session, '/dev/zero'), /普通文件/);
     await assert.rejects(() => files.list(session, folder + '/missing'));
+    await assert.rejects(files.run(session, { operation: 'createWorktree', branch: 'remotecc/no-repo' }));
+    await command(connections, session, 'import subprocess\np=' + JSON.stringify(folder) + '\nsubprocess.run(["git","init",p],check=True,capture_output=True)\nsubprocess.run(["git","-C",p,"add","."],check=True)\nsubprocess.run(["git","-C",p,"-c","user.name=Test","-c","user.email=test@example.invalid","commit","-m","fixture"],check=True,capture_output=True)');
+    worktree = await files.run(session, { operation: 'createWorktree', branch: 'remotecc/test' });
+    assert.equal((await files.preview(session, worktree.path + '/' + filename)).text, 'updated\n');
+    await assert.rejects(files.run(session, { operation: 'createWorktree', branch: '--bad' }), /分支/);
+    const history = await require('../src/agent-client.cjs').agentFor(connections).call(session, 'history', { operation: 'list' });
+    assert.ok(Array.isArray(history.sessions));
+    if (history.sessions.length) {
+      const page = await require('../src/agent-client.cjs').agentFor(connections).call(session, 'history', { operation: 'messages', reference: history.sessions[0].reference });
+      assert.ok(Array.isArray(page.records));
+    }
+    console.log('PASS remote worktree contents, invalid branch rejection, history discovery and message loading');
+    await command(connections, session, 'import subprocess,os\nsubprocess.run(["git","-C",' + JSON.stringify(folder) + ',"worktree","remove",' + JSON.stringify(worktree.path) + '],check=True)\nos.rmdir(' + JSON.stringify(folder + '-worktrees') + ')');
+    worktree = null;
     await command(connections, session, 'import shutil; shutil.rmtree(' + JSON.stringify(folder) + ')');
     folder = null;
     await connections.disconnect(session);

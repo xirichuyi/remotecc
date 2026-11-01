@@ -95,7 +95,6 @@ public struct ToolPresentation: Hashable, Sendable {
         case "Read":
             file = string("file_path"); line = input["offset"]?.int
             subject = line.map { "第 \($0) 行起" }
-            hidesOutput = true
         case "Write":
             file = string("file_path")
             let content = string("content") ?? ""

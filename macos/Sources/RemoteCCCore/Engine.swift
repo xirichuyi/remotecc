@@ -18,6 +18,7 @@ public final class ChatEngine {
     private var installs: [String: Task<Void, Error>] = [:]
     private var capabilityCache: [String: Capabilities] = [:]
     private var capabilityRequests: [String: Task<Capabilities, Error>] = [:]
+    private var historyLoads: [String: Task<Void, Error>] = [:]
     private var changeQueued = false
     private var dirty = Set<String>()
     private var saveQueued = false
@@ -91,8 +92,11 @@ public final class ChatEngine {
     // MARK: Connection
 
     public func updateConnection(_ config: ConnectionConfig, _ state: ConnectionState) {
+        let wasConnected = connectionStates[config.key]?.status == .connected
         connectionStates[config.key] = state
-        if state.status == .connected { capabilityCache = [:] }
+        if state.status == .connected && !wasConnected {
+            capabilityCache = capabilityCache.filter { !$0.key.hasPrefix(config.key + "|") }
+        }
         notify()
     }
     public func connectionState(_ config: ConnectionConfig) -> ConnectionState { connectionStates[config.key] ?? ConnectionState() }
@@ -591,10 +595,70 @@ public final class ChatEngine {
                     "version": session.capabilities?.version.map(JSON.string) ?? .null, "tools": session.tools ?? [], "plugins": session.plugins ?? []]
         case "cost": return session.usage ?? ["message": "尚无用量数据"]
         case "tasks": return session.tasks ?? []
+        case "context":
+            guard session.remoteOwner != nil else { throw RemoteError("此历史会话尚未建立实时运行环境，无法获取准确的上下文占用。") }
+            return try await control(id, action: "context")
         case "skills": return try JSON.from(try await capabilities(id).commands.filter { $0.builtin != true })
         case "agents": return try JSON.from(try await capabilities(id).agents ?? [])
         default:
             return session.remoteOwner != nil ? try await control(id, action: section) : try await inspect(session, action: section)
+        }
+    }
+
+    public func rewindFiles(_ id: String, checkpoint: String, token: String? = nil) async throws -> JSON {
+        let session = sessions[try index(id)]
+        guard !session.isBusy, session.messages.contains(where: { $0.checkpointId == checkpoint }) else { throw RemoteError("检查点不可用或会话正在运行") }
+        var value: JSON = ["checkpoint": .string(checkpoint), "preview": .bool(token == nil)]
+        if let token { value["token"] = .string(token) }
+        let result = try await control(id, action: "rewind", value: value)
+        if token != nil { files.invalidate(session.config) }
+        return result
+    }
+
+    public func stopBackgroundTask(_ id: String, task: String) async throws {
+        _ = try await control(id, action: "stopTask", value: .string(task))
+    }
+
+    /// Refresh imported transcripts only when no local worker owns their writes.
+    /// Walk back to a known record so >50 newly appended records cannot form a gap.
+    public func refreshHistory(_ id: String) async throws {
+        try hydrate(id)
+        let original = sessions[try index(id)]
+        guard let reference = original.remoteHistoryRef, original.historyLoaded != false,
+              !original.isBusy, original.remoteOwner == nil else { return }
+        let known = Set(original.messages.map(\.id))
+        var records: [JSON] = [], cursor: String?, visited = Set<String>()
+        for _ in 0..<200 {
+            var request: JSON = ["operation": "messages", "reference": .string(reference)]
+            if let cursor { request["before"] = .string(cursor) }
+            let page = try await agents.call(original.config, "history", request)
+            let batch = page["records"]?.array ?? []
+            records = batch + records
+            let overlaps = batch.contains { known.contains($0["uuid"]?.string ?? "") }
+            cursor = page["before"]?.string
+            if overlaps || cursor == nil { break }
+            guard let cursor, visited.insert(cursor).inserted else { throw RemoteError("远端历史分页重复，请重试") }
+        }
+        let position = try index(id)
+        // A local send may have started while the network request was in flight.
+        guard !sessions[position].isBusy, sessions[position].remoteOwner == nil,
+              sessions[position].messages == original.messages else { return }
+        let incoming = historyMessages(records)
+        if let first = incoming.firstIndex(where: { known.contains($0.id) }),
+           let anchor = original.messages.firstIndex(where: { $0.id == incoming[first].id }) {
+            let incomingIDs = Set(incoming.map(\.id))
+            guard original.messages[anchor...].allSatisfy({ incomingIDs.contains($0.id) }) else {
+                throw RemoteError("远端历史分支已变化，已保留本地消息；请重新打开远端分支后继续。")
+            }
+            sessions[position].messages = Array(original.messages[..<anchor]) + Array(incoming[first...])
+        } else if original.messages.isEmpty {
+            sessions[position].messages = incoming
+        } else if !incoming.isEmpty {
+            throw RemoteError("远端历史已重置或发生分支变化，已保留本地记录。")
+        }
+        if sessions[position].messages != original.messages {
+            sessions[position].updatedAt = max(original.updatedAt, incoming.last?.createdAt ?? 0)
+            changed(id)
         }
     }
 
@@ -637,6 +701,15 @@ public final class ChatEngine {
     }
 
     public func loadHistory(_ id: String, older: Bool = false) async throws {
+        let key = id + (older ? ":older" : ":latest")
+        if let pending = historyLoads[key] { return try await pending.value }
+        let task = Task { try await self.loadHistoryPage(id, older: older) }
+        historyLoads[key] = task
+        defer { historyLoads[key] = nil }
+        try await task.value
+    }
+
+    private func loadHistoryPage(_ id: String, older: Bool) async throws {
         try hydrate(id)
         let session = sessions[try index(id)]
         guard let reference = session.remoteHistoryRef, older || session.historyLoaded == false else { return }
@@ -647,6 +720,9 @@ public final class ChatEngine {
         let page = try await agents.call(session.config, "history", request)
         guard let directory = page["directory"]?.string, directory.hasPrefix("/") else { throw RemoteError("历史中缺少工作目录，无法安全续接此会话") }
         let position = try index(id)
+        // A response arriving over a slow network must not replace a newly started local turn.
+        guard !sessions[position].isBusy, sessions[position].remoteOwner == nil,
+              sessions[position].remoteHistoryRef == reference else { return }
         let existing = Set(sessions[position].messages.map(\.id))
         sessions[position].messages = historyMessages(page["records"]?.array ?? []).filter { !existing.contains($0.id) } + sessions[position].messages
         sessions[position].directory = directory

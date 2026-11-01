@@ -153,3 +153,42 @@ test('subagent steps stay under their tool; system events and resets become visi
   assert.equal(message.blocks[0].output, 'a\n[图片]');
   assert.equal(message.activity, undefined);
 });
+
+test('rate limits and authentication have durable structured status and clear on recovery', () => {
+  const message = newAssistant('status');
+  const transcript = new Transcript(message);
+  transcript.consume({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', resetsAt: 1800000000 } });
+  assert.equal(message.serviceIssue.kind, 'rate_limit');
+  assert.equal(message.serviceIssue.resetsAt, 1800000000);
+  transcript.consume({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 3 });
+  transcript.consume({ type: 'system', subtype: 'task_progress', task_id: 't' });
+  assert.match(message.activity, /重试/);
+  transcript.consume({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } });
+  assert.equal(message.serviceIssue, undefined);
+  transcript.consume({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', errorCode: 'credits_required' } });
+  assert.equal(message.serviceIssue.kind, 'credits');
+  transcript.consume({ type: 'auth_status', error: 'Login expired' });
+  assert.equal(message.serviceIssue.kind, 'auth');
+  transcript.consume({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } });
+  assert.equal(message.serviceIssue.kind, 'auth');
+  transcript.consume({ type: 'auth_status', isAuthenticating: false, output: [] });
+  assert.equal(message.serviceIssue, undefined);
+});
+
+test('background membership replaces stale tasks; unsupported dialogs do not settle another client’s request', async () => {
+  const service = new ChatService(memoryStore());
+  const session = service.create({ host: 'test', directory: '~' });
+  const message = newAssistant('reply');
+  const run = { message, transcript: new Transcript(message), stopped: false };
+  service.consumeEvent(session, { type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'task1', description: 'scan' }] }, run);
+  assert.equal(session.tasks[0].id, 'task1');
+  service.consumeEvent(session, { type: 'system', subtype: 'background_tasks_changed', tasks: [] }, run);
+  assert.deepEqual(session.tasks, []);
+  const options = service.options(session, run);
+  assert.deepEqual(options.supportedDialogKinds, []);
+  await assert.rejects(options.onUserDialog({ dialogKind: 'new_unknown_kind' }), /Unsupported dialog/);
+  service.consumeEvent(session, { type: 'system', subtype: 'task_started', task_id: 'late' }, run);
+  assert.ok(!session.tasks.some(task => task.id === 'late'));
+  assert.match(message.blocks.at(-1).text, /暂不支持/);
+  await service.close();
+});

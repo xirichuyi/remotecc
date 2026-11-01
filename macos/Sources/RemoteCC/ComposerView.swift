@@ -6,14 +6,20 @@ import RemoteCCCore
 
 struct ComposerArea: View {
     @EnvironmentObject private var model: AppModel
+    @State private var editorHeight: CGFloat = 76
     @State private var caret = 0
     @State private var selection = 0
     @State private var dismissedText: String?
     @State private var mentions: [FileEntry] = []
     @State private var mentionTask: Task<Void, Never>?
     @State private var dropTarget = false
+    @State private var changingModel = false
 
-    private var id: String { model.activeId ?? "" }
+    private var id: String { model.activeId ?? "welcome-" + (model.currentConfig?.key ?? "local") }
+    private var canSend: Bool {
+        !model.uploadingSessions.contains(id) && model.currentConfig != nil && model.isConnected && model.active?.historyLoaded != false &&
+        (!text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(model.attachments[id] ?? []).isEmpty)
+    }
     private var text: Binding<String> {
         Binding(get: { model.drafts[id] ?? "" }, set: { model.drafts[id] = $0 })
     }
@@ -37,6 +43,10 @@ struct ComposerArea: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if !model.isConnected {
+                Label(model.connectionState.status == .connecting ? "正在连接…" : "未连接", systemImage: "network.slash")
+                    .font(.system(size: 12)).foregroundStyle(.secondary).padding(.horizontal, 4)
+            }
             if let session = model.active {
                 todoStrip(session)
                 ForEach(session.permissions) { permission in
@@ -48,13 +58,25 @@ struct ComposerArea: View {
             else if !mentions.isEmpty { mentionMenu }
             VStack(alignment: .leading, spacing: 6) {
                 attachmentChips
-                PromptEditor(text: text, caret: $caret, placeholder: "发送消息…", handler: handleKey, onPasteImage: { model.pasteImage($0) })
-                    .frame(minHeight: 44, maxHeight: 160)
+                if model.uploadingSessions.contains(id) { ProgressView("正在上传附件…").controlSize(.small).font(.caption) }
+                ForEach(model.failedUploads[id] ?? [], id: \.self) { url in
+                    HStack {
+                        Label(url.lastPathComponent + " 上传失败", systemImage: "exclamationmark.circle").lineLimit(1)
+                        Spacer()
+                        Button("重试") { model.upload([url], to: model.failedUploadDirectories[id]?[url]) }.disabled(model.uploadingSessions.contains(id) || !model.isConnected)
+                        Button("移除") { model.failedUploads[id]?.removeAll { $0 == url } }
+                    }.font(.caption).foregroundStyle(.secondary)
+                }
+                PromptEditor(text: text, caret: $caret, placeholder: model.isConnected ? "你想一起完成什么？" : "可以先写下任务，连接 SSH 后发送…", handler: handleKey, onPasteImage: { model.pasteImage($0) }, focusToken: model.composerFocus, onHeightChange: { editorHeight = $0 })
+                    .frame(height: editorHeight)
                 toolbarRow
             }
-            .padding(12)
-            .background(RoundedRectangle(cornerRadius: 12).strokeBorder(dropTarget ? Color.accentColor : Color.secondary.opacity(0.3)))
+            .padding(16)
+            .background(WorkbenchTheme.surface, in: RoundedRectangle(cornerRadius: 24))
+            .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(dropTarget ? WorkbenchTheme.accent : WorkbenchTheme.border))
+            .shadow(color: .black.opacity(0.025), radius: 10, y: 2)
             .onDrop(of: [.fileURL], isTargeted: $dropTarget) { providers in
+                guard model.isConnected else { model.show("先连接服务器，再附加文件"); return false }
                 for provider in providers {
                     _ = provider.loadObject(ofClass: URL.self) { url, _ in
                         if let url { Task { @MainActor in model.upload([url]) } }
@@ -70,13 +92,14 @@ struct ComposerArea: View {
             .font(.caption2).foregroundStyle(.secondary)
         }
         .padding(.horizontal, 22).padding(.bottom, 12).padding(.top, 8)
-        .frame(maxWidth: 860)
+        .frame(maxWidth: 1080)
         .frame(maxWidth: .infinity)
         .onChange(of: text.wrappedValue) { refreshMentions() }
         .onChange(of: caret) { selection = 0 }
     }
 
     private var activity: String {
+        guard model.isConnected else { return "选择服务器并连接后即可发送，草稿会保留。" }
         guard let session = model.active else { return "Enter 发送 · Shift + Enter 换行" }
         if session.status == "detached" { return "重新连接 SSH 后同步远端任务" }
         guard session.isBusy else { return "Enter 发送 · Shift + Enter 换行" }
@@ -170,21 +193,66 @@ struct ComposerArea: View {
         let modes = ["default": "默认权限", "plan": "计划", "acceptEdits": "自动编辑", "dontAsk": "拒绝未授权", "auto": "自动权限"]
         let busy = session?.isBusy ?? false
         return HStack(spacing: 10) {
-            Button { model.pickAndUpload() } label: { Image(systemName: "plus") }.buttonStyle(.plain).help("上传文件并附加").disabled(!model.isConnected)
-            Text("\(session?.host ?? "未连接") / \(session?.directory ?? "~")").font(.caption2).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-            Spacer()
-            Button(modes[preferences?.permissionMode ?? "default"] ?? "默认权限") { model.showPreferences = true }.buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary)
-            Button(displayed) { model.showPreferences = true }.buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary).lineLimit(1).help(session?.model.map { "上一轮实际模型：" + $0 } ?? "选择模型")
-            if busy {
-                Button { model.stop() } label: { Image(systemName: "stop.circle.fill").font(.title2) }.buttonStyle(.plain).help("停止生成").disabled(session?.status == "stopping" || !model.isConnected)
+            Button { model.pickAndUpload() } label: { Image(systemName: "plus").frame(width: 18, height: 18) }.buttonStyle(QuietButtonStyle()).help("上传文件并附加").disabled(!model.isConnected)
+            if session != nil {
+                Button { model.openProjectPicker() } label: { Image(systemName: "folder") }.buttonStyle(QuietButtonStyle()).help("切换项目").disabled(!model.isConnected)
+                Button(modes[preferences?.permissionMode ?? "default"] ?? "默认权限") { model.showPreferences = true }.buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary).disabled(!model.isConnected)
+                Spacer(minLength: 12)
+                Menu {
+                    if let session {
+                        ForEach(session.capabilities?.models ?? []) { option in
+                            Button {
+                                changingModel = true
+                                Task { @MainActor in
+                                    defer { changingModel = false }
+                                    do { try await model.engine?.selectModel(session.id, option.value == "default" ? "" : option.value) }
+                                    catch { model.show(error.localizedDescription) }
+                                }
+                            } label: {
+                                if option.value == (modelName ?? "default") {
+                                    Label(option.displayName ?? option.value, systemImage: "checkmark")
+                                } else { Text(option.displayName ?? option.value) }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("刷新模型列表") { model.refreshCapabilities(force: true) }
+                    Button("自定义模型与更多设置…") { model.showPreferences = true }
+                } label: { Text(changingModel ? "切换中…" : displayed).font(.caption).lineLimit(1) }
+                .menuStyle(.borderlessButton).fixedSize().disabled(!model.isConnected || changingModel)
             }
-            Button { send() } label: { Image(systemName: "arrow.up.circle.fill").font(.title2) }
-                .buttonStyle(.plain).help(busy ? "排队，当前回复完成后发送" : "发送消息")
-                .disabled(session?.historyLoaded == false || !model.isConnected || (text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && (model.attachments[id] ?? []).isEmpty))
+            if session == nil { Spacer() }
+            if busy {
+                Button { model.stop() } label: { Image(systemName: "stop.fill").font(.system(size: 12)).foregroundStyle(.white).frame(width: 30, height: 30).background(WorkbenchTheme.accent, in: Circle()) }.buttonStyle(.plain).help("停止生成").disabled(session?.status == "stopping" || !model.isConnected)
+            }
+            Button { send() } label: {
+                Image(systemName: busy ? "text.badge.plus" : "arrow.up")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(canSend ? WorkbenchTheme.onInk : Color.secondary.opacity(0.45))
+                    .frame(width: 30, height: 30)
+                    .background(canSend ? WorkbenchTheme.ink : Color.primary.opacity(0.05), in: Circle())
+            }
+                .buttonStyle(.plain).foregroundStyle(canSend ? WorkbenchTheme.accent : Color.secondary.opacity(0.35)).help(busy ? "排队，当前回复完成后发送" : "发送消息")
+                .accessibilityLabel(busy ? "加入队列" : "发送消息")
+                .disabled(!canSend)
         }
     }
 
-    private func send() { model.submit(text: text.wrappedValue) }
+    private func send() {
+        guard canSend else { return }
+        if model.active == nil {
+            let draft = text.wrappedValue
+            let source = id
+            guard let config = model.currentConfig else { return }
+            model.perform {
+                guard let engine = model.engine else { return }
+                let session = try engine.create(config)
+                model.drafts[session.id] = draft
+                model.drafts.removeValue(forKey: source)
+                model.select(session.id)
+                model.submit(text: draft)
+            }
+        } else { model.submit(text: text.wrappedValue) }
+    }
 
     private func handleKey(_ key: PromptKey) -> Bool {
         if !completions.isEmpty {
@@ -278,6 +346,8 @@ struct PromptEditor: NSViewRepresentable {
     let placeholder: String
     let handler: (PromptKey) -> Bool
     let onPasteImage: (Data) -> Void
+    var focusToken: UUID? = nil
+    var onHeightChange: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -292,8 +362,18 @@ struct PromptEditor: NSViewRepresentable {
         view.autoresizingMask = original.autoresizingMask
         view.isRichText = false; view.allowsUndo = true; view.drawsBackground = false
         view.isAutomaticQuoteSubstitutionEnabled = false; view.isAutomaticDashSubstitutionEnabled = false
-        view.font = .systemFont(ofSize: 13)
+        view.font = .systemFont(ofSize: 14)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 4
+        view.defaultParagraphStyle = paragraph
+        view.typingAttributes[.paragraphStyle] = paragraph
+        view.textColor = .labelColor
+        view.insertionPointColor = .labelColor
+        view.placeholder = placeholder
+        view.setAccessibilityLabel(placeholder)
         view.delegate = context.coordinator
+        view.onContentHeight = onHeightChange
+        view.textContainerInset = NSSize(width: 0, height: 6)
         view.onPasteImage = onPasteImage
         scroll.documentView = view
         DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
@@ -302,22 +382,33 @@ struct PromptEditor: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
-        guard let view = scroll.documentView as? NSTextView else { return }
+        guard let view = scroll.documentView as? PasteAwareTextView else { return }
+        view.onContentHeight = onHeightChange
+        view.placeholder = placeholder
+        view.setAccessibilityLabel(placeholder)
+        view.needsDisplay = true
+        let requestedFocus = context.coordinator.focusToken != focusToken
+        if requestedFocus {
+            context.coordinator.focusToken = focusToken
+            DispatchQueue.main.async { view.window?.makeFirstResponder(view) }
+        }
         // Never rewrite the text during input-method composition.
         if view.string != text, !view.hasMarkedText() {
             view.string = text
-            view.setSelectedRange(NSRange(location: min(caret, (text as NSString).length), length: 0))
+            view.setSelectedRange(NSRange(location: requestedFocus ? (text as NSString).length : min(caret, (text as NSString).length), length: 0))
         }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: PromptEditor
+        var focusToken: UUID?
         init(_ parent: PromptEditor) { self.parent = parent }
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
             parent.caret = view.selectedRange().location
             parent.text = view.string
+            (view as? PasteAwareTextView)?.measureContentHeight()
         }
         func textViewDidChangeSelection(_ notification: Notification) {
             guard let view = notification.object as? NSTextView, !view.hasMarkedText() else { return }
@@ -329,7 +420,7 @@ struct PromptEditor: NSViewRepresentable {
             if view.hasMarkedText() { return false }
             switch selector {
             case #selector(NSResponder.insertNewline(_:)):
-                if NSEvent.modifierFlags.contains(.shift) { view.insertNewlineIgnoringFieldEditor(nil); return true }
+                if (NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags).contains(.shift) { view.insertNewlineIgnoringFieldEditor(nil); return true }
                 return parent.handler(.enter)
             case #selector(NSResponder.moveUp(_:)): return parent.handler(.up)
             case #selector(NSResponder.moveDown(_:)): return parent.handler(.down)
@@ -342,7 +433,41 @@ struct PromptEditor: NSViewRepresentable {
 }
 
 final class PasteAwareTextView: NSTextView {
+    var onContentHeight: ((CGFloat) -> Void)?
+    private var lastContentHeight: CGFloat = 0
+    override func layout() {
+        super.layout()
+        measureContentHeight()
+    }
+    func measureContentHeight() {
+        guard let layoutManager, let textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let height = min(200, max(76, ceil(layoutManager.usedRect(for: textContainer).height + textContainerInset.height * 2)))
+        guard abs(height - lastContentHeight) > 0.5 else { return }
+        lastContentHeight = height
+        DispatchQueue.main.async { [weak self] in self?.onContentHeight?(height) }
+    }
     var onPasteImage: ((Data) -> Void)?
+    var placeholder = ""
+
+    override func keyDown(with event: NSEvent) {
+        // Use the event's modifiers; global modifier state can change before the delegate runs.
+        if !hasMarkedText(), (event.keyCode == 36 || event.keyCode == 76), event.modifierFlags.contains(.shift) {
+            insertNewlineIgnoringFieldEditor(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if string.isEmpty {
+            let inset = textContainerInset
+            (placeholder as NSString).draw(in: NSRect(x: inset.width + (textContainer?.lineFragmentPadding ?? 5), y: inset.height,
+                width: max(0, bounds.width - 2 * inset.width - 10), height: bounds.height),
+                withAttributes: [.font: font ?? NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.placeholderTextColor])
+        }
+    }
 
     override func paste(_ sender: Any?) {
         let board = NSPasteboard.general
@@ -359,6 +484,7 @@ final class PasteAwareTextView: NSTextView {
 struct PermissionCard: View {
     @EnvironmentObject private var model: AppModel
     let permission: PermissionRequest
+    var onAnswer: ((JSON) async throws -> Void)? = nil
     @State private var answers: [String: String] = [:]
     @State private var reason = ""
     @State private var useRules = false
@@ -370,20 +496,29 @@ struct PermissionCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Label("等待你的确认", systemImage: "hand.raised.fill").foregroundStyle(WorkbenchTheme.accent)
+                Spacer()
+                if sending { ProgressView().controlSize(.mini); Text("正在提交…").foregroundStyle(.secondary) }
+            }.font(.system(size: 11, weight: .medium)).padding(.bottom, 4)
             if permission.kind == "elicitation" { elicitation } else { approval }
             if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red) }
         }
-        .padding(12)
+        .padding(16)
+        .disabled(sending || (onAnswer == nil && !model.isConnected))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.yellow.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.orange.opacity(0.3)))
+        .background(WorkbenchTheme.accent.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(WorkbenchTheme.accent.opacity(0.25)))
         .font(.callout)
     }
 
     private func submit(_ answer: JSON) {
         sending = true; error = ""
         Task {
-            do { try await model.respond(permission, answer: answer) }
+            do {
+                if let onAnswer { try await onAnswer(answer) }
+                else { try await model.respond(permission, answer: answer) }
+            }
             catch { self.error = error.localizedDescription; sending = false }
         }
     }
@@ -410,11 +545,15 @@ struct PermissionCard: View {
             DisclosureGroup("远端建议的权限规则") { CodeBlock(text: permission.suggestions?.text(pretty: true) ?? "") }.font(.caption)
             Toggle("应用以上权限规则 · " + scope(suggestions), isOn: $useRules).font(.caption)
         }
-        TextField("拒绝时给 Claude 的说明（可选）", text: $reason).textFieldStyle(.roundedBorder).font(.caption)
+        TextField(permission.name == "ExitPlanMode" ? "对计划的修改意见" : "拒绝时给 Claude 的说明（可选）", text: $reason).textFieldStyle(.roundedBorder).font(.caption)
         HStack {
             Spacer()
-            Button("拒绝") { submit(["allow": false, "reason": .string(reason)]) }
-            Button(question ? "提交回答" : useRules ? "应用规则并允许" : "允许这一次") { allow() }.keyboardShortcut(.defaultAction)
+            if permission.name == "ExitPlanMode" {
+                Button("反馈修改意见") { submit(["allow": false, "reason": .string(reason)]) }
+                    .buttonStyle(WorkbenchButtonStyle()).disabled(reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            Button("拒绝") { submit(["allow": false, "reason": .string(reason)]) }.buttonStyle(WorkbenchButtonStyle())
+            Button(question ? "提交回答" : useRules ? "应用规则并允许" : "允许这一次") { allow() }.buttonStyle(WorkbenchButtonStyle(prominent: true))
         }
         .disabled(sending)
     }
@@ -486,7 +625,7 @@ struct PermissionCard: View {
             Spacer()
             Button("取消") { submit(["interaction": ["action": "cancel"]]) }
             Button("拒绝") { submit(["interaction": ["action": "decline"]]) }
-            Button(acceptTitle) { submit(["interaction": accept()]) }.keyboardShortcut(.defaultAction).disabled(!supported)
+            Button(acceptTitle) { submit(["interaction": accept()]) }.buttonStyle(WorkbenchButtonStyle(prominent: true)).disabled(!supported)
         }
         .disabled(sending)
     }

@@ -68,6 +68,20 @@ public final class RemoteProcess: @unchecked Sendable {
         writes.async { try? handle.write(contentsOf: data) }
     }
 
+    /// Await pipe capacity so large uploads cannot queue the entire file in RAM.
+    public func writeAndWait(_ data: Data) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (done: CheckedContinuation<Void, Error>) in
+                let handle = stdin.fileHandleForWriting
+                writes.async {
+                    do { try handle.write(contentsOf: data); done.resume() }
+                    catch { done.resume(throwing: error) }
+                }
+            }
+        }, onCancel: { self.kill() })
+    }
+
     public func closeInput() {
         let handle = stdin.fileHandleForWriting
         writes.async { try? handle.close() }
@@ -136,6 +150,7 @@ public final class SSHConnections: RemoteLauncher, @unchecked Sendable {
     private var desired: [String: ConnectionConfig] = [:]
     private var attempts: [String: Int] = [:]
     private var inFlight = Set<String>()
+    private var checking = Set<String>()
     private var monitor: Task<Void, Never>?
     private let directory: String
     private let executable: String
@@ -165,29 +180,56 @@ public final class SSHConnections: RemoteLauncher, @unchecked Sendable {
     public func state(_ config: ConnectionConfig) -> ConnectionState { withLock { entries[config.key]?.state ?? ConnectionState() } }
     public func tunnels(_ config: ConnectionConfig) -> [Tunnel] { withLock { entries[config.key]?.tunnels ?? [] } }
 
-    private func setState(_ config: ConnectionConfig, _ state: ConnectionState) {
-        withLock { entries[config.key]?.state = state }
-        onState?(config, state)
+    @discardableResult
+    private func setState(_ config: ConnectionConfig, _ state: ConnectionState, socket: String) -> Bool {
+        let current = withLock {
+            guard desired[config.key] != nil, entries[config.key]?.socket == socket else { return false }
+            entries[config.key]?.state = state
+            return true
+        }
+        if current { onState?(config, state) }
+        return current
+    }
+
+    private struct SSHCommandTimeout: LocalizedError {
+        let seconds: UInt64
+        var errorDescription: String? { "SSH 操作超时（\(seconds) 秒）" }
+    }
+    private final class DeadlineState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var expired = false
+        func expire() { lock.lock(); expired = true; lock.unlock() }
+        var didExpire: Bool { lock.lock(); defer { lock.unlock() }; return expired }
     }
 
     private func runSSH(_ arguments: [String], timeout: UInt64) async throws {
         let child = try RemoteProcess(executable: executable, arguments: arguments)
         child.closeInput()
-        let timer = Task { try await Task.sleep(nanoseconds: timeout * 1_000_000_000); child.kill() }
+        let deadline = DeadlineState()
+        let timer = Task {
+            try await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+            deadline.expire(); child.kill()
+        }
         let code = await child.waitForExit()
         timer.cancel()
+        if deadline.didExpire { throw SSHCommandTimeout(seconds: timeout) }
         if code != 0 { throw RemoteError(child.stderrText.isEmpty ? "SSH 连接失败（\(code)）" : child.stderrText) }
     }
 
     public func connect(_ input: ConnectionConfig) async throws {
+        try await connect(input, requiringDesired: false)
+    }
+
+    private func connect(_ input: ConnectionConfig, requiringDesired: Bool) async throws {
         let config = try input.validated()
         let key = config.key
         let proceed: Bool = withLock {
+            if requiringDesired && desired[key] == nil { return false }
             desired[key] = config
             if entries[key]?.state.status == .connected || inFlight.contains(key) { return false }
             inFlight.insert(key)
             let previous = entries[key]
-            entries[key] = Entry(config: config, socket: directory + "/" + String(UInt(bitPattern: key.hashValue), radix: 36), state: ConnectionState(status: attempts[key] != nil ? .reconnecting : .connecting), tunnels: previous?.tunnels ?? [])
+            entries[key] = Entry(config: config, socket: directory + "/" + UUID().uuidString.prefix(12), state: ConnectionState(status: attempts[key] != nil ? .reconnecting : .connecting), tunnels: previous?.tunnels ?? [])
             return true
         }
         guard proceed else {
@@ -196,21 +238,27 @@ public final class SSHConnections: RemoteLauncher, @unchecked Sendable {
             if state(config).status != .connected { throw RemoteError(state(config).error.isEmpty ? "SSH 连接失败" : state(config).error) }
             return
         }
-        let socket = withLock { entries[key]!.socket }
+        guard let socket = withLock({ entries[key]?.socket }) else {
+            _ = withLock { inFlight.remove(key) }; throw CancellationError()
+        }
         defer { _ = withLock { inFlight.remove(key) } }
         onState?(config, state(config))
         do {
             try await runSSH(["-M", "-N", "-f", "-S", socket, "-o", "ControlPersist=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
                               "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "Compression=yes"] + portArguments(config) + [config.host], timeout: 20)
+            guard setState(config, ConnectionState(status: .connected), socket: socket) else {
+                try? await runSSH(["-S", socket, "-O", "exit"] + portArguments(config) + [config.host], timeout: 5)
+                throw CancellationError()
+            }
             let recovered = withLock { attempts.removeValue(forKey: key) != nil && desired[key] != nil }
-            setState(config, ConnectionState(status: .connected))
             if recovered {
                 for tunnel in tunnels(config) { try? await forward(config, tunnel) }
                 onRecovered?(config)
             }
         } catch {
-            setState(config, ConnectionState(status: .error, error: error.localizedDescription))
-            scheduleReconnect(config)
+            if setState(config, ConnectionState(status: .error, error: error.localizedDescription), socket: socket) {
+                scheduleReconnect(config)
+            }
             throw error
         }
     }
@@ -227,7 +275,7 @@ public final class SSHConnections: RemoteLauncher, @unchecked Sendable {
         Task.detached { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self, self.withLock({ self.desired[config.key] != nil }) else { return }
-            try? await self.connect(config)
+            try? await self.connect(config, requiringDesired: true)
         }
     }
 
@@ -238,15 +286,51 @@ public final class SSHConnections: RemoteLauncher, @unchecked Sendable {
         return try RemoteProcess(executable: executable, arguments: ["-T", "-S", socket, "-o", "BatchMode=yes", "-o", "ProxyCommand=false"] + portArguments(config) + [config.host, command])
     }
 
-    /// Also call this on system wake.
+    /// Probe the remote endpoint, not just the local ControlMaster socket.
+    /// Machines are checked concurrently so an unreachable host cannot delay another.
     public func checkConnections() async {
-        let connected = withLock { entries.values.filter { $0.state.status == .connected } }
-        for entry in connected {
-            do { try await runSSH(["-S", entry.socket, "-O", "check"] + portArguments(entry.config) + [entry.config.host], timeout: 5) }
-            catch {
-                setState(entry.config, ConnectionState(status: .error, error: "SSH 连接已断开"))
-                scheduleReconnect(entry.config)
+        let connected = withLock {
+            let candidates = entries.values.filter { $0.state.status == .connected && !checking.contains($0.config.key) }
+            candidates.forEach { checking.insert($0.config.key) }
+            return candidates
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for entry in connected {
+                group.addTask { [self] in
+                    defer { _ = withLock { checking.remove(entry.config.key) } }
+                    do {
+                        try await runSSH(["-T", "-S", entry.socket, "-o", "BatchMode=yes", "-o", "ProxyCommand=false"] + portArguments(entry.config) + [entry.config.host, "true"], timeout: 8)
+                        if !state(entry.config).error.isEmpty {
+                            _ = setState(entry.config, ConnectionState(status: .connected), socket: entry.socket)
+                        }
+                    } catch {
+                        // A delayed probe is not proof that the shared transport is dead.
+                        // Killing a live master here also truncates unrelated downloads.
+                        // OpenSSH's server-alive checks handle an actually unreachable peer.
+                        if error is SSHCommandTimeout,
+                           (try? await runSSH(["-S", entry.socket, "-O", "check"] + portArguments(entry.config) + [entry.config.host], timeout: 2)) != nil {
+                            _ = setState(entry.config, ConnectionState(status: .connected, error: "网络响应较慢，正在检查连接"), socket: entry.socket)
+                            return
+                        }
+                        guard setState(entry.config, ConnectionState(status: .error, error: "SSH 连接已断开"), socket: entry.socket) else { return }
+                        // A live but stale master would otherwise prevent a fresh connection.
+                        try? await runSSH(["-S", entry.socket, "-O", "exit"] + portArguments(entry.config) + [entry.config.host], timeout: 5)
+                        scheduleReconnect(entry.config)
+                    }
+                }
             }
+        }
+    }
+
+    /// A real network-path change or wake should not wait behind an old backoff timer.
+    /// Only reconnect machines the user still wants connected.
+    public func networkBecameAvailable() async {
+        await checkConnections()
+        let configs = withLock {
+            desired.values.filter { entries[$0.key]?.state.status != .connected && !inFlight.contains($0.key) }
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for config in configs { group.addTask { try? await self.connect(config, requiringDesired: true) } }
         }
     }
 

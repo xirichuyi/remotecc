@@ -51,15 +51,16 @@ test('remote supervisor never re-executes a completed or uncertain task', () => 
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
 
-test('a live owner process is not finalized; a dead one reports instead of re-executing', () => {
+test('a live owner process is not finalized; a dead one reports instead of re-executing', async () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'remotecc-owner-live-'));
   const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', 'remote-agent'], { stdio: 'ignore' });
   try {
     fs.writeFileSync(path.join(folder, 'started.json'), JSON.stringify({ pid: child.pid }));
     assert.equal(ownerAlive(folder), true);
     fs.writeFileSync(path.join(folder, 'state.json'), JSON.stringify({ version: 1, resident: true, status: 'working', message: { id: 'm', blocks: [] } }));
+    const exited = require('node:events').once(child, 'exit');
     child.kill('SIGKILL');
-    spawnSync('sleep', ['0.2']);
+    await exited;
     assert.equal(ownerAlive(folder), false);
     const state = finalizeTask(folder);
     assert.equal(state.status, 'error'); assert.equal(state.version, 2); assert.match(state.message.error, /未自动重新执行/);

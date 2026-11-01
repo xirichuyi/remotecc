@@ -3,6 +3,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import RemoteCCCore
+import UserNotifications
 
 enum SidePanel: String, CaseIterable, Identifiable {
     case files = "文件", changes = "变更", search = "搜索"
@@ -16,23 +17,54 @@ final class AppModel: ObservableObject {
     private(set) var connections: SSHConnections?
     private var workspaces: [String: Workspace] = [:]
 
+    @Published var selectedMachine: ConnectionConfig?
+    @Published var savedMachines: [ConnectionConfig] = []
+    @Published var syncingMachines = Set<String>()
+    @Published var machineHistoryStatus: [String: String] = [:]
     @Published var activeId: String?
     @Published var showArchived = false
     @Published var searchText = ""
     @Published var toast: String?
     @Published var panel: SidePanel = .files
-    @Published var showFiles = true
+    @Published var showFiles = false
+    @Published var showProjectPicker = false
+    var proposedProject: String?
+    @Published var composerFocus = UUID()
     @Published var showConnect = false
     @Published var showPreferences = false
     @Published var showQuickOpen = false
     @Published var showSessionTools = false
     @Published var historyStatus = ""
-    @Published var transferStatus = ""
+    @Published private var transferStatuses: [ConnectionConfig: String] = [:]
+    @Published private var batchUploadProgress: [String: String] = [:]
+    var transferStatus: String {
+        guard let active else { return "" }
+        return batchUploadProgress[active.id] ?? transferStatuses[active.config] ?? ""
+    }
     @Published var drafts: [String: String] = [:]
     @Published var attachments: [String: [Attachment]] = [:]
     @Published var commandPicker: CommandInteraction?
     @Published var fatalError: String?
+    #if DEBUG
+    @Published var showChatGallery = false
+    #endif
 
+    @Published var showWorktree = false
+    @Published var showUsage = false
+    @Published var notificationsEnabled = UserDefaults.standard.bool(forKey: "task-notifications")
+    var failedUploadDirectories: [String: [URL: String]] = [:]
+    @Published var failedUploads: [String: [URL]] = [:]
+    @Published var uploadingSessions = Set<String>()
+    @Published var showActivity = false
+    @Published var unreadSessions = Set<String>()
+    @Published var historyRefreshErrors: [String: String] = [:]
+    @Published var refreshingHistory = Set<String>()
+    private var historyPoll: Task<Void, Never>?
+    private var notificationTracker = TaskNotificationTracker()
+    private var notificationRequestID = UUID()
+    @Published var notificationsAuthorizing = false
+    @Published var notificationTestStatus = ""
+    @Published var notificationTestRunning = false
     private var toastTask: Task<Void, Never>?
     private var capabilityRetry: [String: Date] = [:]
     private var capabilityRequests = Set<String>()
@@ -63,14 +95,24 @@ final class AppModel: ObservableObject {
             files.onProgress = { [weak self] progress in
                 Task { @MainActor in
                     guard let self else { return }
-                    if let error = progress.error { self.transferStatus = "\(progress.name) · 失败：\(error)" }
-                    else if progress.finished { self.transferStatus = "\(progress.name) · 完成" }
-                    else { self.transferStatus = "\(progress.name) · \(progress.total > 0 ? min(99, progress.bytes * 100 / progress.total) : 0)%" }
+                    if let error = progress.error { self.transferStatuses[progress.config] = "\(progress.name) · 失败：\(error)" }
+                    else if progress.finished { self.transferStatuses[progress.config] = "\(progress.name) · 完成" }
+                    else { self.transferStatuses[progress.config] = "\(progress.name) · \(progress.total > 0 ? min(99, progress.bytes * 100 / progress.total) : 0)%" }
                 }
             }
-            activeId = sortedSessions.first?.id
-            if let activeId { select(activeId) }
+            savedMachines = UserDefaults.standard.data(forKey: "saved-machines").flatMap { try? JSONDecoder().decode([ConnectionConfig].self, from: $0) } ?? []
+            for config in sessions.map(\.config) + [lastConnection].compactMap({ $0 }) {
+                if !savedMachines.contains(where: { $0.key == config.key }) { savedMachines.append(config) }
+            }
+            selectedMachine = lastConnection ?? savedMachines.first
             autoConnect()
+            historyPoll = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    guard !Task.isCancelled, let self else { return }
+                    if let id = self.activeId, self.isConnected { await self.refreshVisibleHistory(id, report: false) }
+                }
+            }
         } catch { fatalError = error.localizedDescription }
     }
 
@@ -88,7 +130,25 @@ final class AppModel: ObservableObject {
         get { UserDefaults.standard.data(forKey: lastConnectionKey).flatMap { try? JSONDecoder().decode(ConnectionConfig.self, from: $0) } }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: lastConnectionKey) }
     }
-    var currentConfig: ConnectionConfig? { active?.config ?? lastConnection }
+    var currentConfig: ConnectionConfig? { selectedMachine ?? active?.config ?? lastConnection }
+    var machineSessions: [ChatSession] { sortedSessions.filter { $0.config.key == currentConfig?.key } }
+
+    func selectMachine(_ config: ConnectionConfig) {
+        selectedMachine = config
+        lastConnection = config
+        activeId = nil
+        searchText = ""; showArchived = false
+        historyStatus = machineHistoryStatus[config.key] ?? ""
+        if engine?.connectionState(config).status != .connected {
+            perform { try await self.connect(config) }
+        }
+    }
+
+    private func rememberMachine(_ config: ConnectionConfig) {
+        if let index = savedMachines.firstIndex(where: { $0.key == config.key }) { savedMachines[index] = config }
+        else { savedMachines.append(config) }
+        UserDefaults.standard.set(try? JSONEncoder().encode(savedMachines), forKey: "saved-machines")
+    }
     var connectionState: ConnectionState { currentConfig.flatMap { engine?.connectionState($0) } ?? ConnectionState() }
     var isConnected: Bool { connectionState.status == .connected }
     var hasUnsavedEdits: Bool { workspaces.values.contains(where: \.hasUnsavedEdits) }
@@ -116,6 +176,21 @@ final class AppModel: ObservableObject {
     private var lastBusy: [String: Bool] = [:]
     private func engineChanged() {
         objectWillChange.send()
+        for session in sessions {
+            let background = Set((session.tasks?.array ?? []).filter { $0["status"]?.string == "running" && $0["ambient"]?.bool != true }.compactMap { $0["id"]?.string })
+            let isViewed = session.id == activeId && NSApp.isActive && NSApp.windows.contains { $0.isVisible && !$0.isMiniaturized && $0.canBecomeMain }
+            if let body = notificationTracker.update(id: session.id, status: session.status, background: background,
+                connected: engine?.connectionState(session.config).status == .connected, isViewed: isViewed) {
+                unreadSessions.insert(session.id)
+                if notificationsEnabled {
+                    Task {
+                        do { try await postNotification(id: session.id, title: "RemoteCC · " + session.host, body: body, sessionId: session.id) }
+                        catch { show("系统通知发送失败：" + error.localizedDescription) }
+                    }
+                }
+            }
+        }
+        NSApp.dockTile.badgeLabel = unreadSessions.isEmpty ? nil : String(unreadSessions.count)
         for session in sessions where session.id == activeId {
             let busy = session.isBusy
             // Without working watches, follow the turn's end instead of live pushes.
@@ -144,26 +219,36 @@ final class AppModel: ObservableObject {
 
     private func autoConnect() {
         guard let config = currentConfig, lastConnection != nil else { return }
-        Task { try? await connect(config) }
+        perform { try await self.connect(config) }
     }
 
     func connect(_ input: ConnectionConfig) async throws {
         guard let engine, let connections else { return }
-        let config = try input.validated()
+        var config = try input.validated()
+        // Connecting a machine never depends on a remembered project's existence.
+        config.directory = "~"
+        guard !syncingMachines.contains(config.key) else { return }
+        syncingMachines.insert(config.key)
+        defer { syncingMachines.remove(config.key) }
+        selectedMachine = config
+        activeId = nil
+        searchText = ""; showArchived = false
         try await connections.connect(config)
-        let info = try await engine.agents.info(config)
-        var target = config
-        if target.directory.isEmpty { target.directory = info.home }
-        lastConnection = target
-        if info.claude == nil { show("已连接，但服务器上未找到 claude 命令，聊天不可用。文件功能不受影响。") }
-        if let current = active, current.config == target {} else {
-            let session = try engine.create(target)
-            select(session.id)
+        rememberMachine(config)
+        if selectedMachine?.key == config.key { lastConnection = config }
+        do {
+            let info = try await engine.agents.info(config)
+            config.directory = info.home
+            rememberMachine(config)
+            if selectedMachine?.key == config.key { selectedMachine = config; lastConnection = config }
+            if info.claude == nil { show("SSH 已连接。远端未找到 Claude Code，仍可查看可用历史。") }
+            await discoverHistory(config)
+            await engine.restore(config)
+        } catch {
+            machineHistoryStatus[config.key] = "SSH 已连接，历史加载失败，可重试"
+            if selectedMachine?.key == config.key { historyStatus = machineHistoryStatus[config.key]! }
+            show(error.localizedDescription)
         }
-        await activeWorkspace?.browse(active?.directory ?? target.directory)
-        refreshCapabilities()
-        Task { await engine.restore(target) }
-        Task { await discoverHistory(target) }
     }
 
     func disconnect() {
@@ -183,7 +268,7 @@ final class AppModel: ObservableObject {
     /// After an automatic reconnect the tree reloads, watches return and tasks are rejoined.
     private func recovered(_ config: ConnectionConfig) async {
         guard let engine else { return }
-        engine.files.invalidate()
+        engine.files.invalidate(config)
         await engine.restore(config)
         if active?.config.key == config.key { await activeWorkspace?.reload(force: true) }
     }
@@ -195,11 +280,13 @@ final class AppModel: ObservableObject {
 
     func discoverHistory(_ config: ConnectionConfig) async {
         guard let engine else { return }
-        historyStatus = "读取远端会话…"
+        machineHistoryStatus[config.key] = "正在同步历史…"
+        if currentConfig?.key == config.key { historyStatus = "正在同步历史…" }
         do {
             let result = try await engine.discoverHistory(config)
-            historyStatus = "\(config.host) · \(result.count) 条远端会话" + (result.unreadable > 0 ? " · \(result.unreadable) 条不可读" : "")
-        } catch { historyStatus = "历史读取失败"; show(error.localizedDescription) }
+            machineHistoryStatus[config.key] = "已同步 \(result.count) 条对话" + (result.unreadable > 0 ? " · \(result.unreadable) 条不可读" : "")
+        } catch { machineHistoryStatus[config.key] = "历史同步失败，点击刷新重试"; show(error.localizedDescription) }
+        if currentConfig?.key == config.key { historyStatus = machineHistoryStatus[config.key] ?? "" }
     }
 
     // MARK: Conversations
@@ -207,28 +294,89 @@ final class AppModel: ObservableObject {
     func select(_ id: String) {
         guard let engine else { return }
         activeId = id
+        unreadSessions.remove(id)
+        NSApp.dockTile.badgeLabel = unreadSessions.isEmpty ? nil : String(unreadSessions.count)
         do { try engine.hydrate(id) } catch { show(error.localizedDescription) }
         guard let session = engine.session(id) else { return }
-        if session.historyLoaded == false { perform { try await engine.loadHistory(id) } }
+        selectedMachine = savedMachines.first(where: { $0.key == session.config.key }) ?? session.config
+        if session.historyLoaded == false, isConnected { perform { try await engine.loadHistory(id) } }
         if engine.connectionState(session.config).status == .connected {
             let workspace = workspace(for: session)
             if workspace?.root == nil { Task { await workspace?.browse(session.directory) } }
             refreshCapabilities()
+            Task { await refreshVisibleHistory(id, report: false) }
         }
+    }
+
+    func refreshVisibleHistory(_ id: String, report: Bool = true) async {
+        guard let engine, !refreshingHistory.contains(id), let session = engine.session(id),
+              engine.connectionState(session.config).status == .connected else { return }
+        refreshingHistory.insert(id)
+        defer { refreshingHistory.remove(id) }
+        do { try await engine.refreshHistory(id); historyRefreshErrors[id] = nil }
+        catch {
+            historyRefreshErrors[id] = error.localizedDescription
+            if report { show(error.localizedDescription) }
+        }
+    }
+
+    var attentionSessions: [ChatSession] {
+        sortedSessions.filter { $0.isBusy || !$0.permissions.isEmpty || unreadSessions.contains($0.id) ||
+            ($0.tasks?.array ?? []).contains { $0["status"]?.string == "running" && $0["ambient"]?.bool != true } }
     }
 
     func newConversation() {
         guard let engine else { return }
-        guard let config = currentConfig, isConnected else { showConnect = true; return }
+        searchText = ""; showArchived = false
+        guard let config = currentConfig else {
+            activeId = nil
+            composerFocus = UUID()
+            return
+        }
         perform {
             let session = try engine.create(config, preferences: self.active?.preferences)
+            if self.activeId == nil { self.drafts[session.id] = self.drafts.removeValue(forKey: "welcome-" + config.key) }
             self.select(session.id)
+            self.composerFocus = UUID()
         }
     }
 
     func newConversation(in source: ChatSession) {
         guard let engine else { return }
-        perform { self.select(try engine.create(source.config).id) }
+        searchText = ""; showArchived = false
+        perform {
+            self.select(try engine.create(source.config, preferences: source.preferences).id)
+            self.composerFocus = UUID()
+        }
+    }
+
+    func chooseProject(_ directory: String) async throws {
+        guard let engine, let source = active, isConnected else { throw RemoteError("请先连接服务器") }
+        let listing = try await engine.files.list(source.config, directory, hidden: false, force: true)
+        guard listing.path != source.directory else { return }
+        var config = source.config
+        config.directory = listing.path
+        let session = try engine.create(config, preferences: source.preferences)
+        // Move only the unsent draft; the old conversation and its running task remain bound to their project.
+        drafts[session.id] = drafts.removeValue(forKey: source.id)
+        attachments[session.id] = attachments.removeValue(forKey: source.id)
+        searchText = ""; showArchived = false
+        select(session.id)
+        composerFocus = UUID()
+    }
+
+    func createWorktree(_ branch: String) async throws {
+        guard let source = active, let engine, isConnected else { throw RemoteError("请先连接项目所在的机器") }
+        let result = try await engine.files.run(source.config, "createWorktree", ["branch": .string(branch)], timeout: 90)
+        guard let directory = result["path"]?.string else { throw RemoteError("工作区已创建，但远端没有返回路径") }
+        var config = source.config; config.directory = directory
+        do { select(try engine.create(config, preferences: source.preferences).id) }
+        catch { throw RemoteError("工作区已创建在 \(directory)，新建对话失败：\(error.localizedDescription)") }
+    }
+
+    func openProjectPicker(_ directory: String? = nil) {
+        proposedProject = directory ?? active?.directory
+        showProjectPicker = true
     }
 
     func refreshCapabilities(force: Bool = false) {
@@ -245,7 +393,7 @@ final class AppModel: ObservableObject {
     }
 
     func submit(text: String) {
-        guard let engine, let id = activeId else { showConnect = !isConnected; return }
+        guard let engine, let id = activeId else { return }
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let files = attachments[id] ?? []
         guard !value.isEmpty || !files.isEmpty else { return }
@@ -298,6 +446,26 @@ final class AppModel: ObservableObject {
     func respond(_ permission: PermissionRequest, answer: JSON) async throws {
         guard let engine, let id = activeId else { return }
         try await engine.respond(id, permission: permission.id, answer: answer)
+    }
+
+    func archiveProject(_ project: ChatSession, archived: Bool) {
+        guard let engine else { return }
+        let sessions = machineSessions.filter { $0.projectKey == project.projectKey }
+        guard !sessions.contains(where: { $0.isBusy || $0.queue?.isEmpty == false }) else {
+            show("请先完成或停止此项目中的任务"); return
+        }
+        if archived {
+            let alert = NSAlert()
+            alert.messageText = "从侧栏移除项目？"
+            alert.informativeText = "\(project.directory)\n将归档该项目的 \(sessions.count) 条对话，可从已归档列表恢复。远端文件夹和聊天历史不会删除。"
+            alert.addButton(withTitle: "取消")
+            alert.addButton(withTitle: "移除项目")
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+        perform {
+            for session in sessions { try engine.setArchived(session.id, archived) }
+            if sessions.contains(where: { $0.id == self.activeId }) { self.activeId = nil }
+        }
     }
 
     func deleteConversation(_ session: ChatSession) {
@@ -369,15 +537,107 @@ final class AppModel: ObservableObject {
     }
 
     func upload(_ urls: [URL], to directory: String? = nil) {
-        guard let engine, let session = active, isConnected else { show("请先连接 SSH"); return }
+        guard let engine, let config = currentConfig, isConnected else { show("请先连接 SSH"); return }
+        guard !urls.isEmpty else { return }
         guard urls.count <= 20 else { show("一次最多上传 20 个文件"); return }
+        if active == nil {
+            do {
+                let session = try engine.create(config)
+                drafts[session.id] = drafts.removeValue(forKey: "welcome-" + config.key)
+                select(session.id)
+                composerFocus = UUID()
+            } catch { show(error.localizedDescription); return }
+        }
+        guard let session = active else { return }
         let target = directory ?? session.directory
+        guard !uploadingSessions.contains(session.id) else { show("请等待当前上传完成"); return }
+        uploadingSessions.insert(session.id)
         perform {
-            for url in urls {
-                do { self.addAttachments([try await engine.files.upload(session.config, file: url, directory: target)], to: session.id) }
-                catch { self.show(url.lastPathComponent + ": " + error.localizedDescription) }
+            defer {
+                self.uploadingSessions.remove(session.id)
+                self.batchUploadProgress[session.id] = nil
             }
+            if urls.count > 1 { self.batchUploadProgress[session.id] = "正在上传 · 0/\(urls.count) 个文件已处理" }
+            let results = await engine.files.uploadBatch(session.config, files: urls, directory: target) { [weak self] completed, total in
+                guard total > 1, let self else { return }
+                await MainActor.run { self.batchUploadProgress[session.id] = "正在上传 · \(completed)/\(total) 个文件已处理" }
+            }
+            for result in results {
+                let url = result.file
+                if let attachment = result.attachment {
+                    self.addAttachments([attachment], to: session.id)
+                    self.failedUploads[session.id]?.removeAll { $0 == url }
+                    self.failedUploadDirectories[session.id]?[url] = nil
+                } else {
+                    self.failedUploadDirectories[session.id, default: [:]][url] = target
+                    if !(self.failedUploads[session.id] ?? []).contains(url) { self.failedUploads[session.id, default: []].append(url) }
+                    self.show(url.lastPathComponent + ": " + (result.error ?? "上传失败"))
+                }
+            }
+            let succeeded = results.filter { $0.attachment != nil }.count
+            self.transferStatuses[session.config] = "上传完成 · \(succeeded)/\(urls.count) 个成功"
             await self.workspace(for: session)?.reload(force: true)
+        }
+    }
+
+    func markActiveRead() {
+        if let activeId { unreadSessions.remove(activeId) }
+        NSApp.dockTile.badgeLabel = unreadSessions.isEmpty ? nil : String(unreadSessions.count)
+    }
+
+    private func postNotification(id: String, title: String, body: String, sessionId: String?) async throws {
+        let content = UNMutableNotificationContent()
+        content.title = title; content.body = body; content.sound = .default
+        if let sessionId { content.userInfo = ["sessionId": sessionId] }
+        try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
+    }
+
+    func testNotification() {
+        guard !notificationTestRunning else { return }
+        notificationTestRunning = true; notificationTestStatus = "正在发送…"
+        Task {
+            defer { notificationTestRunning = false }
+            do {
+                let center = UNUserNotificationCenter.current()
+                let settings = await center.notificationSettings()
+                guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+                    notificationTestStatus = "系统尚未允许通知，请先开启通知权限。"; return
+                }
+                let id = "remotecc-test-" + UUID().uuidString
+                try await postNotification(id: id, title: "RemoteCC 通知测试", body: "任务通知已送达。", sessionId: activeId)
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+                let delivered = await center.deliveredNotifications()
+                notificationTestStatus = delivered.contains { $0.request.identifier == id } ? "已在系统通知中心确认送达" : "已提交，但未确认送达；请检查专注模式与系统通知设置。"
+            } catch { notificationTestStatus = "通知测试失败：" + error.localizedDescription }
+        }
+    }
+
+    func setNotifications(_ enabled: Bool) {
+        let request = UUID(); notificationRequestID = request
+        if !enabled {
+            notificationsAuthorizing = false; notificationsEnabled = false
+            UserDefaults.standard.set(false, forKey: "task-notifications")
+            return
+        }
+        notificationsAuthorizing = true; notificationTestStatus = "正在请求系统通知权限…"
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            guard let self, self.notificationRequestID == request, self.notificationsAuthorizing else { return }
+            self.notificationRequestID = UUID()
+            self.notificationsAuthorizing = false
+            self.notificationTestStatus = "系统通知授权未响应，请检查系统权限提示后重试。"
+        }
+        Task {
+            defer { if notificationRequestID == request { notificationsAuthorizing = false } }
+            do {
+                let allowed = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound])
+                guard notificationRequestID == request else { return }
+                notificationsEnabled = allowed
+                UserDefaults.standard.set(allowed, forKey: "task-notifications")
+                notificationTestStatus = allowed ? "系统通知已允许，可发送测试通知。" : "系统未允许通知，请在系统设置中允许 RemoteCC 通知。"
+            } catch {
+                if notificationRequestID == request { notificationTestStatus = "通知权限请求失败：" + error.localizedDescription }
+            }
         }
     }
 
@@ -416,6 +676,7 @@ final class AppModel: ObservableObject {
     }
 
     func shutdown() {
+        historyPoll?.cancel()
         engine?.shutdown()
         let connections = self.connections
         let semaphore = DispatchSemaphore(value: 0)

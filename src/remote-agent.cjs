@@ -294,6 +294,23 @@ async function gitFileDiff(request) {
   return { text: untracked.stdout };
 }
 
+async function createWorktree(request) {
+  const folder = resolve(request.base ?? '~');
+  const branch = request.branch;
+  if (typeof branch !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_./-]{0,99}$/.test(branch)) throw new Error('分支名称仅支持字母、数字、横线、下划线、点和斜线');
+  const valid = await git(folder, 'check-ref-format', '--branch', branch);
+  if (valid.code) throw new Error('无效的 Git 分支名');
+  const top = await git(folder, 'rev-parse', '--show-toplevel');
+  if (top.code) throw new Error('当前项目不是 Git 仓库');
+  const root = top.stdout.trim();
+  const parent = path.join(path.dirname(root), path.basename(root) + '-worktrees');
+  await fsp.mkdir(parent, { recursive: true });
+  const destination = path.join(parent, branch.replaceAll('/', '-') + '-' + crypto.randomBytes(4).toString('hex'));
+  const result = await git(root, 'worktree', 'add', '-b', branch, '--', destination, 'HEAD');
+  if (result.code) throw new Error(result.stderr || '无法创建工作区');
+  return { path: destination, branch };
+}
+
 async function hello() {
   const located = await run('sh', ['-c', 'command -v claude']);
   const version = process.versions.node.split('.').map(Number);
@@ -304,7 +321,7 @@ async function hello() {
 
 const fileOperations = {
   hello, list: listing, preview, save, suggest, search, stat: request => regular(resolve(request.path, request.base)),
-  diff: gitDiffText, gitStatus, gitFileDiff, create: createEntry, rename: renameEntry, remove: removeEntry,
+  diff: gitDiffText, gitStatus, gitFileDiff, createWorktree, create: createEntry, rename: renameEntry, remove: removeEntry,
 };
 
 // ---------------------------------------------------------------- transfers (separate SSH channel)
@@ -599,7 +616,7 @@ function safeRecord(row) {
     }
     if (blocks.length >= 100) break;
   }
-  return { type: row.type, uuid: row.uuid, timestamp: row.timestamp, message: { id: message.id || row.uuid, content: blocks } };
+  return { type: row.type, uuid: row.uuid, timestamp: row.timestamp, ...(row.isApiErrorMessage === true || row.error ? { isApiErrorMessage: true, error: typeof row.error === 'string' ? row.error.slice(0, 200) : undefined } : {}), message: { id: message.id || row.uuid, content: blocks } };
 }
 
 async function historyMessages(request) {

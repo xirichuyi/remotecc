@@ -1,5 +1,6 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import MarkdownUI
 import AppKit
 import RemoteCCCore
 
@@ -8,20 +9,61 @@ struct ChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if let session = model.active {
-                MessagesList(session: session)
+            if model.active == nil {
+                MachineHomeView()
+            } else if let session = model.active, !session.messages.isEmpty || session.remoteHistoryRef != nil {
+                MessagesList(session: session).id(session.id)
+                ComposerArea()
             } else {
-                ContentUnavailableView("新对话", systemImage: "bubble.left.and.bubble.right", description: Text(model.isConnected ? "" : "点击左下角「连接 SSH」连接你的服务器"))
-                    .frame(maxHeight: .infinity)
+                WelcomeView()
             }
-            ComposerArea()
         }
+        .background(WorkbenchTheme.canvas)
+    }
+}
+
+struct WelcomeView: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 48)
+            VStack(spacing: 28) {
+                HStack(spacing: 12) {
+                    Image(systemName: "terminal").font(.system(size: 28, weight: .medium)).foregroundStyle(WorkbenchTheme.accent)
+                    Text("今天，想完成什么？")
+                        .font(.system(size: 30, weight: .regular, design: .serif)).tracking(-0.6)
+                }
+                ComposerArea()
+                HStack(spacing: 8) {
+                    suggestion("了解项目", icon: "folder", prompt: "请梳理这个项目的目录结构、技术栈和主要入口。")
+                    suggestion("检查代码", icon: "text.magnifyingglass", prompt: "请检查当前项目，找出影响使用的问题并给出改进建议。")
+                    suggestion("实现功能", icon: "chevron.left.forwardslash.chevron.right", prompt: "我想实现一个新功能：")
+                }
+                .opacity((model.drafts[model.activeId ?? "welcome"] ?? "").isEmpty ? 1 : 0)
+                .disabled(!(model.drafts[model.activeId ?? "welcome"] ?? "").isEmpty)
+                .accessibilityHidden(!(model.drafts[model.activeId ?? "welcome"] ?? "").isEmpty)
+            }
+            .frame(maxWidth: 600).padding(.horizontal, 36)
+            Spacer(minLength: 80)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func suggestion(_ title: String, icon: String, prompt: String) -> some View {
+        Button { model.drafts[model.activeId ?? "welcome"] = prompt; model.composerFocus = UUID() } label: {
+            Label(title, systemImage: icon).font(.system(size: 12))
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(WorkbenchTheme.surface.opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(WorkbenchTheme.border))
+        }.buttonStyle(.plain)
     }
 }
 
 struct MessagesList: View {
     @EnvironmentObject private var model: AppModel
     let session: ChatSession
+    @State private var followsReply = true
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -30,18 +72,29 @@ struct MessagesList: View {
                     if session.remoteHistoryRef != nil { HistoryNotice(session: session) }
                     ForEach(Array(session.messages.enumerated()), id: \.element.id) { index, message in
                         // Equatable lets unchanged messages skip rendering while the last one streams.
-                        MessageRow(message: message, busy: index == session.messages.count - 1 && session.isBusy, actions: FileActions(open: { model.open($0, line: $1) }))
+                        MessageRow(message: message, busy: index == session.messages.count - 1 && session.isBusy, sessionStatus: session.status, showHeader: index == 0 || session.messages[index - 1].role != "assistant", actions: FileActions(open: { model.open($0, line: $1) }))
                             .equatable()
                             .id(message.id)
                     }
                     Color.clear.frame(height: 1).id("bottom")
                 }
-                .padding(.horizontal, 26).padding(.vertical, 20)
-                .frame(maxWidth: 860, alignment: .leading)
+                .padding(.horizontal, 32).padding(.vertical, 32)
+                .frame(maxWidth: 1080, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
-            .onChange(of: session.messages.last) { proxy.scrollTo("bottom", anchor: .bottom) }
-            .onChange(of: session.id) { proxy.scrollTo("bottom", anchor: .bottom) }
+            .background(ScrollReadingDetector { followsReply = false })
+            .overlay(alignment: .bottomTrailing) {
+                if !followsReply {
+                    Button {
+                        followsReply = true
+                        withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    } label: { Label("回到最新", systemImage: "arrow.down") }
+                        .buttonStyle(WorkbenchButtonStyle()).shadow(color: .black.opacity(0.08), radius: 8, y: 3).padding(16)
+                }
+            }
+            .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+            .onChange(of: followsReply) { if followsReply { proxy.scrollTo("bottom", anchor: .bottom) } }
+            .onChange(of: session.messages.last) { if followsReply { proxy.scrollTo("bottom", anchor: .bottom) } }
         }
     }
 }
@@ -52,6 +105,8 @@ struct HistoryNotice: View {
 
     var body: some View {
         HStack {
+            if let error = model.historyRefreshErrors[session.id] { Text(error).foregroundStyle(.orange) }
+            if model.refreshingHistory.contains(session.id) { ProgressView().controlSize(.mini) }
             Text(session.historyLoaded == false ? "正在加载远端消息…" : "远端历史 · 图片原始数据和超长内容未下载")
             if session.historyLoaded == false {
                 Button("加载消息") { model.perform { try await model.engine?.loadHistory(session.id) } }
@@ -71,23 +126,32 @@ struct FileActions {
 struct MessageRow: View, Equatable {
     let message: ChatMessage
     let busy: Bool
+    var sessionStatus: String = "idle"
+    var showHeader = true
     let actions: FileActions
+    @EnvironmentObject private var model: AppModel
+    @State private var copied = false
+    @State private var showRewind = false
 
-    static func == (a: MessageRow, b: MessageRow) -> Bool { a.busy == b.busy && a.message == b.message }
+    static func == (a: MessageRow, b: MessageRow) -> Bool { a.busy == b.busy && a.sessionStatus == b.sessionStatus && a.showHeader == b.showHeader && a.message == b.message }
 
     var body: some View {
-        if message.role == "user" { userBody } else { assistantBody }
+        Group { if message.role == "user" { userBody } else { assistantBody } }
+            .sheet(isPresented: $showRewind) {
+                if let checkpoint = message.checkpointId, let id = model.activeId { RewindSheet(sessionId: id, checkpoint: checkpoint) }
+            }
     }
 
     private var userBody: some View {
         VStack(alignment: .trailing, spacing: 6) {
             Text(message.text ?? "")
                 .textSelection(.enabled)
-                .padding(.horizontal, 14).padding(.vertical, 10)
-                .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                .font(.system(size: 14)).lineSpacing(5)
+                .padding(.horizontal, 20).padding(.vertical, 14)
+                .background(WorkbenchTheme.userBubble, in: RoundedRectangle(cornerRadius: 20))
             if let files = message.attachments {
                 ForEach(files) { file in
-                    Button { actions.open(file.path, nil) } label: { Label(file.name, systemImage: "paperclip") }.buttonStyle(.link).font(.caption)
+                    ChatAttachmentView(file: file)
                 }
             }
         }
@@ -96,29 +160,84 @@ struct MessageRow: View, Equatable {
 
     private var assistantBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array((message.blocks ?? []).enumerated()), id: \.offset) { _, block in
-                BlockView(block: block, actions: actions)
+            if showHeader && busy {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.mini)
+                    Text(activityLabel).font(.system(size: 12)).foregroundStyle(.secondary)
+                }.padding(.bottom, 10)
+                Divider().padding(.bottom, 8)
+            }
+            ForEach(Array((message.blocks ?? []).enumerated()), id: \.offset) { index, block in
+                BlockView(block: block, actions: actions, thinkingActive: busy && sessionStatus == "working" && index == (message.blocks?.count ?? 0) - 1)
+            }
+            if let issue = message.serviceIssue {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(issue["title"]?.string ?? "服务暂不可用", systemImage: "exclamationmark.circle").font(.system(size: 13, weight: .medium))
+                    Text(issue["detail"]?.string ?? "").font(.system(size: 12)).textSelection(.enabled)
+                    if let reset = issue["resetsAt"]?.double {
+                        Text("预计恢复：" + Date(timeIntervalSince1970: reset).formatted(date: .abbreviated, time: .shortened)).font(.caption)
+                    }
+                }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
             }
             if let error = message.error {
-                Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
-                    .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.red.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("本次回复未完成", systemImage: "exclamationmark.circle").font(.system(size: 13, weight: .medium))
+                    Text(error).font(.system(size: 12)).textSelection(.enabled)
+                    Button("重新编辑上一条请求") { restoreRequest() }
+                        .buttonStyle(WorkbenchButtonStyle()).disabled(model.active?.isBusy == true)
+                }.foregroundStyle(.red).padding(14).frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.red.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
             }
-            if busy && message.error == nil { ProgressView().controlSize(.small) }
+            if busy && message.error == nil {
+                HStack(spacing: 8) {
+                    if sessionStatus == "permission" { Image(systemName: "hand.raised").foregroundStyle(WorkbenchTheme.accent) }
+                    else { ProgressView().controlSize(.mini) }
+                    Text(message.activity ?? activityLabel).font(.system(size: 12)).foregroundStyle(.secondary)
+                }.padding(.vertical, 8).accessibilityElement(children: .combine)
+            }
             if message.interrupted == true { Text("已停止生成 · 可以发送下一条消息继续").font(.caption).foregroundStyle(.secondary) }
             if !busy { footer }
         }
     }
 
+    private var activityLabel: String {
+        if sessionStatus == "permission" { return "需要你的确认，请查看输入框上方的请求" }
+        if sessionStatus == "stopping" { return "正在停止，已生成的内容会保留…" }
+        if sessionStatus == "detached" { return "连接已中断，等待重新同步远端任务" }
+        if message.blocks?.contains(where: { $0.type == "tool" && $0.status == "running" }) == true { return "正在执行工具…" }
+        if message.blocks?.last?.type == "thinking" { return "正在思考…" }
+        return (message.blocks ?? []).isEmpty ? "等待 Claude 响应…" : "正在生成回复…"
+    }
+
+    private func restoreRequest() {
+        guard let session = model.active,
+              let index = session.messages.firstIndex(where: { $0.id == message.id }),
+              let request = session.messages[..<index].last(where: { $0.role == "user" }) else { return }
+        guard (model.drafts[session.id] ?? "").isEmpty, (model.attachments[session.id] ?? []).isEmpty else {
+            model.show("输入框已有草稿，请先保留或发送草稿后再重新编辑。"); return
+        }
+        model.drafts[session.id] = request.text ?? ""
+        model.attachments[session.id] = request.attachments ?? []
+        model.composerFocus = UUID()
+    }
+
     @ViewBuilder private var footer: some View {
         let text = (message.blocks ?? []).filter { $0.type == "text" }.compactMap(\.text).joined(separator: "\n\n")
         let parts = [message.model, message.durationMs.map { String(format: "%.1fs", $0 / 1000) }, message.costUSD.map { String(format: "$%.4f", $0) }].compactMap { $0 }
-        if !text.isEmpty || !parts.isEmpty {
+        if !text.isEmpty || !parts.isEmpty || message.checkpointId != nil {
             HStack(spacing: 10) {
                 if !text.isEmpty {
-                    Button("复制回复") { copyToPasteboard(text) }.buttonStyle(.plain)
+                    Button { copyToPasteboard(text); copied = true } label: {
+                        Label(copied ? "已复制" : "复制回复", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }.buttonStyle(QuietButtonStyle()).task(id: copied) {
+                        if copied { try? await Task.sleep(nanoseconds: 2_000_000_000); copied = false }
+                    }
                 }
-                Text(parts.joined(separator: " · "))
+                if message.checkpointId != nil {
+                    Button { showRewind = true } label: { Label("回退文件", systemImage: "arrow.uturn.backward") }.buttonStyle(QuietButtonStyle()).disabled(model.active?.isBusy == true || !model.isConnected)
+                }
+                Text(parts.joined(separator: " · ")).lineLimit(1).truncationMode(.middle)
             }
             .font(.caption2).foregroundStyle(.secondary)
         }
@@ -133,15 +252,12 @@ func copyToPasteboard(_ text: String) {
 struct BlockView: View {
     let block: Block
     let actions: FileActions
+    var thinkingActive = false
 
     var body: some View {
         switch block.type {
         case "text": MarkdownView(text: block.text ?? "", actions: actions)
-        case "thinking":
-            DisclosureGroup("思考过程") {
-                Text(block.text ?? "").font(.callout).foregroundStyle(.secondary).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .font(.callout).foregroundStyle(.secondary)
+        case "thinking": ThinkingCard(text: block.text ?? "", active: thinkingActive)
         case "tool": ToolCard(block: block, actions: actions)
         case "notice":
             Text(block.text ?? "").font(.caption)
@@ -150,19 +266,20 @@ struct BlockView: View {
                 .padding(.vertical, 6)
                 .overlay(alignment: .top) { if block.level == "boundary" { Divider() } }
                 .overlay(alignment: .bottom) { if block.level == "boundary" { Divider() } }
-        default: EmptyView()
+        default: Text(block.text ?? "暂不支持的消息类型：\(block.type)").font(.caption).foregroundStyle(.secondary)
         }
     }
 }
 
 struct ToolCard: View {
+    @EnvironmentObject private var model: AppModel
     let block: Block
     let actions: FileActions
     @State private var expanded: Bool?
 
     private var presentation: ToolPresentation { ToolPresentation(name: block.name, input: block.input) }
     private var isOpen: Binding<Bool> {
-        Binding(get: { expanded ?? (presentation.startsOpen || block.status == "error") }, set: { expanded = $0 })
+        Binding(get: { expanded ?? (block.status == "error") }, set: { expanded = $0 })
     }
     private var dotColor: Color {
         switch block.status {
@@ -174,13 +291,20 @@ struct ToolCard: View {
     }
     private var statusText: String {
         if block.status == "running" { return block.elapsed.map { "\(Int($0))s" } ?? "执行中" }
-        return ["error": "失败", "stopped": "已停止"][block.status ?? ""] ?? ""
+        return ["error": "失败", "stopped": "已停止", "history": "历史记录", "done": "已完成"][block.status ?? ""] ?? "待执行"
     }
 
     var body: some View {
         let view = presentation
         DisclosureGroup(isExpanded: isOpen) {
             VStack(alignment: .leading, spacing: 6) {
+                if let file = view.file, ["Read", "Write", "Edit", "MultiEdit", "NotebookEdit"].contains(block.name ?? "") {
+                    HStack {
+                        Button("打开文件") { actions.open(file, view.line) }
+                        Button("下载") { model.download(file) }
+                        if block.name != "Read" { Button("查看变更") { model.panel = .changes; model.showFiles = true } }
+                    }.font(.caption).disabled(!model.isConnected)
+                }
                 if let summary = block.summary { Text(summary).font(.caption).foregroundStyle(.secondary) }
                 if let body = view.body { ToolBodyView(body: body, actions: actions) }
                 if let children = block.children, !children.isEmpty {
@@ -198,12 +322,16 @@ struct ToolCard: View {
                 if let text = block.agentText { Text(text).font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                 if let output = block.output, !output.isEmpty, !view.hidesOutput || block.status == "error" {
                     CodeBlock(text: output, color: block.status == "error" ? .red : .secondary)
+                } else if block.name == "Read" {
+                    Text(block.status == "running" ? "正在读取文件…" : block.status == "history" ? "这条历史记录没有保存读取结果，可打开文件查看当前内容。" : "未返回可显示的内容。")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .padding(.top, 4)
         } label: {
             HStack(spacing: 7) {
-                Circle().fill(dotColor).frame(width: 6, height: 6)
+                if block.status == "running" { ProgressView().controlSize(.mini) }
+                else { Image(systemName: block.status == "error" ? "xmark.circle" : block.status == "done" ? "checkmark.circle" : "terminal").foregroundStyle(dotColor) }
                 Text(view.title).fontWeight(.medium)
                 if let file = view.file {
                     Button(file) { actions.open(file, view.line) }.buttonStyle(.link).lineLimit(1).truncationMode(.head)
@@ -214,9 +342,8 @@ struct ToolCard: View {
             }
             .font(.caption)
         }
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 7))
-        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.secondary.opacity(0.18)))
+        .padding(.vertical, 7).padding(.horizontal, 2)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -264,6 +391,7 @@ struct CodeBlock: View {
             Text(text).font(.system(size: 11, design: .monospaced)).foregroundStyle(color).textSelection(.enabled)
                 .padding(8).frame(maxWidth: .infinity, alignment: .leading)
         }
+        .defaultScrollAnchor(.topLeading)
         .frame(maxHeight: 320)
         .fixedSize(horizontal: false, vertical: true)
         .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 5))
@@ -306,9 +434,9 @@ struct MarkdownView: View {
     let actions: FileActions
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            ForEach(Array(parseMarkdown(text).enumerated()), id: \.offset) { _, block in blockView(block) }
-        }
+        Markdown(text)
+            .markdownTheme(.remoteCC)
+            .textSelection(.enabled)
         .environment(\.openURL, OpenURLAction { url in
             // Links such as `src/app.js` refer to the server; only web links leave the app.
             if ["http", "https"].contains(url.scheme ?? "") { return .systemAction }
@@ -318,70 +446,5 @@ struct MarkdownView: View {
         })
     }
 
-    @ViewBuilder private func blockView(_ block: MarkdownBlock) -> some View {
-        switch block {
-        case .heading(let level, let value):
-            inline(value).font(headingFont(level)).fontWeight(.semibold).padding(.top, 6)
-        case .paragraph(let value): inline(value)
-        case .code(_, let value):
-            VStack(alignment: .trailing, spacing: 0) {
-                Button("复制代码") { copyToPasteboard(value) }.buttonStyle(.plain).font(.caption2).foregroundStyle(.secondary).padding(4)
-                ScrollView(.horizontal) {
-                    Text(value).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).padding(.horizontal, 10).padding(.bottom, 10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
-        case .list(let items):
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                    HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(item.marker).foregroundStyle(.secondary)
-                        inline(item.text)
-                    }
-                    .padding(.leading, CGFloat(item.indent) * 14)
-                }
-            }
-        case .quote(let value):
-            inline(value).foregroundStyle(.secondary).padding(.leading, 12)
-                .overlay(alignment: .leading) { Rectangle().fill(Color.secondary.opacity(0.4)).frame(width: 3) }
-        case .table(let rows):
-            ScrollView(.horizontal) {
-                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 5) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                        GridRow {
-                            ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
-                                inline(cell).fontWeight(index == 0 ? .semibold : .regular)
-                            }
-                        }
-                        if index == 0 { Divider() }
-                    }
-                }
-                .padding(8)
-            }
-            .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
-        case .rule: Divider()
-        }
-    }
-
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: return .title2
-        case 2: return .title3
-        default: return .headline
-        }
-    }
-
-    private func inline(_ value: String) -> Text {
-        // Code spans that look like file paths become links back into the app.
-        var attributed = (try? AttributedString(markdown: value, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(value)
-        for run in attributed.runs where run.inlinePresentationIntent?.contains(.code) == true {
-            let content = String(attributed[run.range].characters)
-            if remotePathReference(content) != nil, let url = URL(string: "rcc-file:" + (content.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? content)) {
-                attributed[run.range].link = url
-            }
-        }
-        return Text(attributed)
-    }
 }
 #endif

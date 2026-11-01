@@ -32,9 +32,13 @@ public func historyMessages(_ records: [JSON]) -> [ChatMessage] {
         let blocks = event["message"]?["content"]?.array ?? []
         if event["type"]?.string == "user" {
             for result in blocks where result["type"]?.string == "tool_result" {
-                guard let target = messages.indices.last, messages[target].role == "assistant",
+                guard let target = messages.indices.reversed().first(where: { messages[$0].blocks?.contains(where: { $0.id == result["tool_use_id"]?.string }) == true }),
                       let index = messages[target].blocks?.firstIndex(where: { $0.id == result["tool_use_id"]?.string }) else { continue }
-                messages[target].blocks?[index].output = result["content"]?.string
+                let content = result["content"]
+                messages[target].blocks?[index].output = content?.string ?? content?.array?.map { item in
+                    if let text = item["text"]?.string { return text }
+                    return "[" + (item["type"]?.string ?? "非文本结果") + "]"
+                }.joined(separator: "\n")
                 if result["is_error"]?.isTruthy == true { messages[target].blocks?[index].status = "error" }
             }
             let text = historyUserText(blocks.filter { $0["type"]?.string == "text" }.compactMap { $0["text"]?.string }.joined(separator: "\n"))
@@ -49,8 +53,22 @@ public func historyMessages(_ records: [JSON]) -> [ChatMessage] {
                 default: break
                 }
             }
-            messages.append(ChatMessage(id: identifier, role: "assistant", blocks: converted, createdAt: timestamp))
+            var message = ChatMessage(id: identifier, role: "assistant", blocks: converted, createdAt: timestamp)
+            if event["isApiErrorMessage"]?.bool == true || event["error"]?.string != nil {
+                let detail = converted.filter { $0.type == "text" }.compactMap(\.text).joined(separator: "\n")
+                message.error = detail.isEmpty ? (event["error"]?.string ?? "远端请求失败") : detail
+            }
+            messages.append(message)
         }
     }
     return messages
+}
+
+/// Compact titles for imported CLI sessions; do not expose their XML envelopes in navigation.
+public func historyDisplayTitle(_ text: String) -> String {
+    let cleaned = historyUserText(text)
+        .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return cleaned.isEmpty ? "未命名对话" : String(cleaned.prefix(80))
 }

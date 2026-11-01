@@ -12,6 +12,16 @@ final class LocalLauncher: RemoteLauncher, @unchecked Sendable {
     }
 }
 
+/// Fault injection affects bulk transfer only; metadata still uses the real agent.
+final class BrokenTransferLauncher: RemoteLauncher, @unchecked Sendable {
+    let base: LocalLauncher
+    let command: String
+    init(home: String, command: String) { base = LocalLauncher(home: home); self.command = command }
+    func spawn(_ config: ConnectionConfig, command: String) throws -> RemoteProcess {
+        try base.spawn(config, command: command.contains(" transfer ") ? self.command : command)
+    }
+}
+
 let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
 
 func run(_ executable: String, _ arguments: [String], input: Data? = nil) throws -> Data {
@@ -55,7 +65,10 @@ final class AgentEnvironment {
         home = FileManager.default.temporaryDirectory.appendingPathComponent("rcc-swift-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         resourcesDirectory = home.appendingPathComponent("resources")
-        let node = try XCTUnwrap(["/usr/bin/node", "/usr/local/bin/node"].first { FileManager.default.isExecutableFile(atPath: $0) } ?? Self.which("node"))
+        let node = try XCTUnwrap(Self.which("node"))
+        // Keep the fixture's login shell on the same Node as the test process.
+        let nodeDirectory = URL(fileURLWithPath: node).deletingLastPathComponent().path.replacingOccurrences(of: "'", with: "'\"'\"'")
+        try ("export PATH='" + nodeDirectory + "':$PATH\n").write(to: home.appendingPathComponent(".bash_profile"), atomically: true, encoding: .utf8)
         _ = try run(node, [repository.appendingPathComponent("macos/scripts/prepare-server.cjs").path, resourcesDirectory.path])
         if standIn {
             let script = "const{createHash:c}=require('crypto'),z=require('zlib'),fs=require('fs');const d=Buffer.from(JSON.stringify({'task-worker.cjs':fs.readFileSync(0,'utf8')}));const m=JSON.parse(fs.readFileSync(process.argv[1]));m.bundleDigest=c('sha256').update(d).digest('hex');m.bundlePayload=z.gzipSync(d).toString('base64');fs.writeFileSync(process.argv[1],JSON.stringify(m));"
@@ -93,6 +106,127 @@ final class AgentTests: XCTestCase {
         }
         do { _ = try await environment.files.list(environment.config, "/definitely/missing", hidden: false); XCTFail("expected failure") }
         catch { XCTAssertTrue(error.localizedDescription.contains("ENOENT")) }
+    }
+
+    func testLateDisconnectCallbackCannotEvictReplacementChannel() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let old = try await environment.agents.channel(environment.config)
+        environment.agents.close(environment.config)
+        let replacement = try await environment.agents.channel(environment.config)
+        XCTAssertFalse(old === replacement)
+        // Simulate EOF delivery racing behind a successful reconnect.
+        old.onClosed?()
+        let reused = try await environment.agents.channel(environment.config)
+        XCTAssertTrue(reused === replacement)
+        let hello = try await reused.call("file", ["operation": "hello"])
+        XCTAssertNotNil(hello["home"]?.string)
+    }
+
+    func testDownloadNeverDeletesDestinationDirectory() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let source = environment.home.appendingPathComponent("source.txt")
+        try "download".write(to: source, atomically: true, encoding: .utf8)
+        let destination = environment.home.appendingPathComponent("existing-folder")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        let important = destination.appendingPathComponent("keep.txt")
+        try "keep".write(to: important, atomically: true, encoding: .utf8)
+        do {
+            try await environment.files.download(environment.config, source.path, to: destination)
+            XCTFail("Must not replace a directory with a downloaded file")
+        } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
+        XCTAssertEqual(try String(contentsOf: important), "keep")
+    }
+
+    func testInterruptedOrTruncatedDownloadPreservesExistingFile() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let source = environment.home.appendingPathComponent("source.txt")
+        try "complete remote contents".write(to: source, atomically: true, encoding: .utf8)
+        let destination = environment.home.appendingPathComponent("existing.txt")
+        try "original local contents".write(to: destination, atomically: true, encoding: .utf8)
+        for command in ["printf partial; exit 1", "printf partial; exit 0"] {
+            let launcher = BrokenTransferLauncher(home: environment.home.path, command: command)
+            let agents = AgentClient(launcher: launcher, resources: try ServerResources(directory: environment.resourcesDirectory))
+            let files = RemoteFiles(agents: agents, cacheDirectory: environment.home.appendingPathComponent("fault-cache"))
+            do {
+                try await files.download(environment.config, source.path, to: destination)
+                XCTFail("An interrupted or short download must fail")
+            } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
+            XCTAssertEqual(try String(contentsOf: destination), "original local contents")
+            XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: environment.home.path).contains { $0.hasPrefix(".remotecc-") })
+            agents.close(environment.config)
+        }
+    }
+
+    func testCancelStalledDownloadReturnsPromptlyAndPreservesDestination() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let source = environment.home.appendingPathComponent("source.txt")
+        let destination = environment.home.appendingPathComponent("destination.txt")
+        try "remote".write(to: source, atomically: true, encoding: .utf8)
+        try "keep".write(to: destination, atomically: true, encoding: .utf8)
+        let launcher = BrokenTransferLauncher(home: environment.home.path, command: "exec sleep 4")
+        let agents = AgentClient(launcher: launcher, resources: try ServerResources(directory: environment.resourcesDirectory))
+        let files = RemoteFiles(agents: agents, cacheDirectory: environment.home.appendingPathComponent("cancel-cache"))
+        _ = try await agents.info(environment.config)
+        let task = Task { try await files.download(environment.config, source.path, to: destination) }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let start = Date(); task.cancel()
+        do { try await task.value; XCTFail("Cancelled download succeeded") } catch { }
+        print("CANCEL stalled download returned in \(Int(Date().timeIntervalSince(start) * 1000))ms")
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2)
+        XCTAssertEqual(try String(contentsOf: destination), "keep")
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: environment.home.path).contains { $0.hasPrefix(".remotecc-") })
+        agents.close(environment.config)
+    }
+
+    func testBatchUploadKeepsOrderAndSuccessfulFilesWhenOneFails() async throws {
+        let env = try AgentEnvironment(); defer { env.cleanup() }
+        let folder = env.home.appendingPathComponent("batch-target")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let first = env.home.appendingPathComponent("first.txt"), last = env.home.appendingPathComponent("last.txt")
+        let missing = env.home.appendingPathComponent("missing.txt")
+        try "first".write(to: first, atomically: true, encoding: .utf8)
+        try "last".write(to: last, atomically: true, encoding: .utf8)
+        let results = await env.files.uploadBatch(env.config, files: [first, missing, last], directory: folder.path)
+        XCTAssertEqual(results.map(\.file), [first, missing, last])
+        XCTAssertNotNil(results[0].attachment); XCTAssertNotNil(results[1].error); XCTAssertNotNil(results[2].attachment)
+        XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("first.txt")), "first")
+        XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("last.txt")), "last")
+    }
+
+    func testBatchUploadDuplicateBasenameKeepsFirstSelectionAndNeverOverwrites() async throws {
+        let env = try AgentEnvironment(); defer { env.cleanup() }
+        let a = env.home.appendingPathComponent("a"), b = env.home.appendingPathComponent("b"), target = env.home.appendingPathComponent("target")
+        for folder in [a, b, target] { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
+        let first = a.appendingPathComponent("same.txt"), second = b.appendingPathComponent("same.txt")
+        try "chosen first".write(to: first, atomically: true, encoding: .utf8)
+        try "chosen second".write(to: second, atomically: true, encoding: .utf8)
+        let results = await env.files.uploadBatch(env.config, files: [first, second], directory: target.path)
+        XCTAssertNotNil(results[0].attachment); XCTAssertNotNil(results[1].error)
+        XCTAssertEqual(try String(contentsOf: target.appendingPathComponent("same.txt")), "chosen first")
+    }
+
+    func testUploadProgressCarriesItsMachineAndProject() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        final class Events: @unchecked Sendable {
+            let lock = NSLock()
+            var values: [TransferProgress] = []
+            func add(_ value: TransferProgress) { lock.lock(); defer { lock.unlock() }; values.append(value) }
+            func snapshot() -> [TransferProgress] { lock.lock(); defer { lock.unlock() }; return values }
+        }
+        let events = Events()
+        environment.files.onProgress = { events.add($0) }
+        for host in ["machine-a", "machine-b"] {
+            let folder = environment.home.appendingPathComponent(host)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let source = environment.home.appendingPathComponent(host + ".txt")
+            try "data".write(to: source, atomically: true, encoding: .utf8)
+            let config = ConnectionConfig(host: host, directory: folder.path)
+            _ = try await environment.files.upload(config, file: source, directory: folder.path)
+            environment.agents.close(config)
+        }
+        let finished = events.snapshot().filter { $0.finished }
+        XCTAssertEqual(Set(finished.map { $0.config.host }), ["machine-a", "machine-b"])
+        XCTAssertTrue(finished.allSatisfy { $0.config.directory.hasSuffix($0.config.host) })
     }
 
     func testTransferEditAndCache() async throws {
@@ -241,6 +375,65 @@ final class AgentTests: XCTestCase {
     }
 
     @MainActor
+    func testIsolatedWorktreeLeavesOriginalChangesUntouched() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let root = environment.home.appendingPathComponent("repo")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        _ = try RemoteCCCoreTests.run("/usr/bin/git", ["-C", root.path, "init"])
+        let file = root.appendingPathComponent("note.txt")
+        try "committed".write(to: file, atomically: true, encoding: .utf8)
+        _ = try RemoteCCCoreTests.run("/usr/bin/git", ["-C", root.path, "add", "note.txt"])
+        _ = try RemoteCCCoreTests.run("/usr/bin/git", ["-C", root.path, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture"])
+        try "uncommitted".write(to: file, atomically: true, encoding: .utf8)
+        var config = environment.config; config.directory = root.path
+        let result = try await environment.files.run(config, "createWorktree", ["branch": "remotecc/test"])
+        let directory = try XCTUnwrap(result["path"]?.string)
+        XCTAssertEqual(try String(contentsOfFile: directory + "/note.txt"), "committed")
+        XCTAssertEqual(try String(contentsOf: file), "uncommitted")
+        do {
+            _ = try await environment.files.run(config, "createWorktree", ["branch": "remotecc/test"])
+            XCTFail("duplicate branch must fail without overwriting the worktree")
+        } catch { XCTAssertFalse(error.localizedDescription.isEmpty) }
+        XCTAssertEqual(try String(contentsOfFile: directory + "/note.txt"), "committed")
+        do {
+            _ = try await environment.files.run(config, "createWorktree", ["branch": "--bad"])
+            XCTFail("should reject an option as a branch")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("分支")) }
+    }
+
+    @MainActor
+    func testFailedDirectoryRefreshPreservesLastLoadedRows() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let folder = environment.home.appendingPathComponent("last-known-folder")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: folder.appendingPathComponent("note.txt"))
+        let workspace = Workspace(files: environment.files, agents: environment.agents, config: environment.config)
+        await workspace.browse(folder.path)
+        XCTAssertEqual(workspace.rows.map(\.entry.name), ["note.txt"])
+        // A failed refresh must preserve a clearly marked snapshot, not blank the panel.
+        await workspace.browse(folder.path + "/unavailable", force: true)
+        XCTAssertEqual(workspace.rows.map(\.entry.name), ["note.txt"])
+        XCTAssertNotNil(workspace.error)
+        XCTAssertTrue(workspace.footer.contains("上次加载"))
+    }
+
+    func testInvalidatingOneServerKeepsOtherServerDirectoryCache() async throws {
+        let environment = try AgentEnvironment(); defer { environment.cleanup() }
+        let folder = environment.home.appendingPathComponent("cache-isolation")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let a = environment.config
+        var b = a; b.host = "other-machine"
+        _ = try await environment.files.list(a, folder.path, hidden: false)
+        _ = try await environment.files.list(b, folder.path, hidden: false)
+        try Data("new".utf8).write(to: folder.appendingPathComponent("new.txt"))
+        environment.files.invalidate(a)
+        let cachedOther = try await environment.files.list(b, folder.path, hidden: false)
+        XCTAssertTrue(cachedOther.entries.isEmpty)
+        let refreshed = try await environment.files.list(a, folder.path, hidden: false)
+        XCTAssertEqual(refreshed.entries.map(\.name), ["new.txt"])
+    }
+
+    @MainActor
     func testHistoryDiscoveryAndLoad() async throws {
         let environment = try AgentEnvironment(); defer { environment.cleanup() }
         // The agent reads CLAUDE_CONFIG_DIR, defaulting to ~/.claude under the fixture HOME.
@@ -262,11 +455,44 @@ final class AgentTests: XCTestCase {
         let session = try XCTUnwrap(engine.sessions.first)
         XCTAssertEqual(session.historyLoaded, false); XCTAssertEqual(session.directory, "/tmp/p"); XCTAssertEqual(session.remoteSessionId, sessionId)
         XCTAssertThrowsError(try engine.send(session.id, text: "x"))
-        try await engine.loadHistory(session.id)
+        async let firstLoad: Void = engine.loadHistory(session.id)
+        async let secondLoad: Void = engine.loadHistory(session.id)
+        _ = try await (firstLoad, secondLoad)
         let messages = try XCTUnwrap(engine.session(session.id)?.messages)
         XCTAssertEqual(messages.map(\.role), ["user", "assistant"])
         XCTAssertEqual(messages[0].text, "/usage")
         XCTAssertEqual(messages[1].blocks?.last?.output, "data")
+        // Another terminal appends more than one history page; refresh must bridge the gap.
+        var appended = lines
+        var parent = "u2"
+        for index in 0..<61 {
+            let id = "external-\(index)"
+            appended.append(["type": "user", "uuid": .string(id), "parentUuid": .string(parent), "cwd": "/tmp/p", "message": ["content": .string("external message \(index)")]])
+            parent = id
+        }
+        let transcript = project.appendingPathComponent(sessionId + ".jsonl")
+        try (appended.map { $0.text() }.joined(separator: "\n") + "\n").write(to: transcript, atomically: true, encoding: .utf8)
+        try await engine.refreshHistory(session.id)
+        XCTAssertEqual(engine.session(session.id)?.messages.count, 63)
+        XCTAssertEqual(engine.session(session.id)?.messages.last?.text, "external message 60")
+        try await engine.refreshHistory(session.id)
+        XCTAssertEqual(engine.session(session.id)?.messages.count, 63)
+        // A concurrent remote branch rewrite must not silently discard our loaded tail.
+        let saved = engine.session(session.id)?.messages
+        let fork: JSON = ["type": "user", "uuid": "forked", "parentUuid": "u2", "cwd": "/tmp/p", "message": ["content": "other branch"]]
+        try ((lines + [fork]).map { $0.text() }.joined(separator: "\n") + "\n").write(to: transcript, atomically: true, encoding: .utf8)
+        do { try await engine.refreshHistory(session.id); XCTFail("branch rewrite must be explicit") }
+        catch { XCTAssertTrue(error.localizedDescription.contains("分支")) }
+        XCTAssertEqual(engine.session(session.id)?.messages, saved)
+        // Same history ID on another machine must not merge with the original machine.
+        var secondMachine = environment.config
+        secondMachine.host = "second-machine"
+        _ = try await engine.discoverHistory(secondMachine)
+        XCTAssertEqual(engine.sessions.count, 2)
+        XCTAssertEqual(Set(engine.sessions.map { $0.config.key }).count, 2)
+        _ = try await engine.discoverHistory(secondMachine)
+        XCTAssertEqual(engine.sessions.count, 2)
+        environment.agents.close(secondMachine)
     }
 }
 
@@ -286,6 +512,15 @@ final class LogicTests: XCTestCase {
         XCTAssertEqual(try ConnectionConfig(host: "ssh axi").validated().host, "axi")
         XCTAssertEqual(try ConnectionConfig(host: "me@1.2.3.4").validated().host, "me@1.2.3.4")
         for bad in ["-oProxyCommand=x", "a b", "", "a;b", "$(x)"] { XCTAssertThrowsError(try ConnectionConfig(host: bad).validated(), bad) }
+    }
+
+    func testPortInputDoesNotSilentlyFallBackToSSHConfig() throws {
+        XCTAssertNil(try ConnectionConfig.parsePort("  "))
+        XCTAssertEqual(try ConnectionConfig.parsePort(" 2222 "), 2222)
+        XCTAssertEqual(try ConnectionConfig.parsePort("65535"), 65535)
+        for value in ["abc", "22x", "0", "65536", "-1", "+22", "22.0", "999999999999999999999999"] {
+            XCTAssertThrowsError(try ConnectionConfig.parsePort(value), value)
+        }
     }
 
     func testCommands() {
@@ -336,7 +571,22 @@ final class LogicTests: XCTestCase {
         XCTAssertThrowsError(try SchemaField.fields(["type": "object", "properties": ["a": ["type": "object"]]]))
     }
 
+    func testReadHistoryResultSurvivesInterleavedAssistantAndArrayContent() throws {
+        let records = try JSON.parse(Data(#"""
+        [
+          {"type":"assistant","message":{"content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file_path":"/tmp/example.txt"}}]}},
+          {"type":"assistant","message":{"content":[{"type":"text","text":"Reading…"}]}},
+          {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"read-1","content":[{"type":"text","text":"first line"},{"type":"text","text":"second line"}]}]}}
+        ]
+        """#.utf8)).array!
+        let messages = historyMessages(records)
+        XCTAssertEqual(messages[0].blocks?.first?.output, "first line\nsecond line")
+        XCTAssertFalse(ToolPresentation(name: "Read", input: ["file_path": "/tmp/example.txt"]).hidesOutput)
+    }
+
     func testHistoryText() {
+        XCTAssertEqual(historyDisplayTitle("<command-name>/clear</command-name><command-message>clear</command-message>"), "/clear")
+
         XCTAssertEqual(historyUserText("<command-name>/x</command-name><command-args>1</command-args>"), "/x 1")
         XCTAssertEqual(historyUserText("<system-reminder>r</system-reminder>\nhello"), "hello")
     }

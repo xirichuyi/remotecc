@@ -23,10 +23,11 @@ function snapshot() {
     capabilities: session.capabilities, tools: session.tools, plugins: session.plugins,
     terminalCommands: session.terminalCommands, usage: session.usage, tasks: session.tasks, forkPending: session.forkPending });
 }
+session.tasks = []; // Background task membership belongs to this SDK process.
 const service = new ChatService({ load: () => [session], save: snapshot });
 service.closing = true;
 service.spawn = (_session, options, onError) => {
-  const child = spawn('claude', options.args, { cwd: session.directory, stdio: ['pipe', 'pipe', 'pipe'], signal: options.signal });
+  const child = spawn('claude', options.args, { cwd: session.directory, stdio: ['pipe', 'pipe', 'pipe'], env: options.env, signal: options.signal });
   child.stderr.setEncoding('utf8'); child.stderr.on('data', onError); return child;
 };
 const input = new SessionInput();
@@ -34,6 +35,7 @@ const run = { stopped: false, stderr: '', message: session.messages.at(-1) };
 run.transcript = new Transcript(run.message);
 service.runs.set(session.id, run);
 let query, handling = false;
+const rewind = require('./checkpoint-control.cjs').checkpointControl(() => query, () => service.runs.has(session.id) || session.tasks?.some(task => task.status === 'running'));
 async function control(command) {
   if (command.kind === 'send') {
     if (run.message.id === command.message.id) return {}; // Replay after an uncertain transport ACK.
@@ -73,6 +75,12 @@ async function control(command) {
         return session.preferences;
       },
       catalogue: async () => { session.capabilities = await catalogue(query); return session.capabilities; },
+      rewind: () => rewind(command.value),
+      stopTask: async () => {
+        if (typeof command.value !== 'string' || !session.tasks?.some(task => task.id === command.value && task.status === 'running')) throw new Error('任务已结束或不存在');
+        if (typeof query.stopTask !== 'function') throw new Error('当前远端版本不支持停止后台任务');
+        await query.stopTask(command.value);
+      },
       context: () => query.getContextUsage({ detail: 'summary' }),
       mcp: () => query.mcpServerStatus(),
       plugins: () => query.reloadPlugins({ holdOnCacheImpact: true }),
@@ -123,6 +131,11 @@ try { commandWatcher = fs.watch(path.join(folder, 'commands'), runCommands); com
       if (event.type === 'result') service.finish(session, run, true);
     } else if (event.type === 'system' && event.subtype === 'commands_changed') {
       session.capabilities.commands = event.commands; snapshot();
+    } else if (event.type === 'system' && (event.task_id || event.subtype === 'background_tasks_changed')) {
+      const status = session.status;
+      service.consumeEvent(session, event, run);
+      session.status = status;
+      snapshot();
     }
   }
 })().catch(error => {

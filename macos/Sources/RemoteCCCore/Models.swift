@@ -10,6 +10,16 @@ public struct ConnectionConfig: Codable, Hashable, Sendable {
     /// Same server regardless of working directory.
     public var key: String { host + ":" + (port.map(String.init) ?? "") }
 
+    public static func parsePort(_ text: String) throws -> Int? {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        guard value.utf8.allSatisfy({ (48...57).contains($0) }),
+              let port = Int(value), (1...65535).contains(port) else {
+            throw RemoteError("SSH 端口需为 1–65535 的整数，留空使用 SSH 配置")
+        }
+        return port
+    }
+
     /// `ssh axi`, `axi` and `user@host` are accepted; anything that could be an ssh option is not.
     public func validated() throws -> ConnectionConfig {
         var result = self
@@ -75,6 +85,8 @@ public struct ChatMessage: Codable, Hashable, Sendable, Identifiable {
     public var error: String?
     public var interrupted: Bool?
     public var activity: String?
+    public var serviceIssue: JSON?
+    public var checkpointId: String?
     public var model: String?
     public var durationMs: Double?
     public var costUSD: Double?

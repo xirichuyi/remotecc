@@ -266,6 +266,9 @@ class ChatService extends EventEmitter {
       pathToClaudeCodeExecutable: '/usr/local/bin/claude',
       systemPrompt: { type: 'preset', preset: 'claude_code' },
       ...(preferences.agent ? { agent: preferences.agent } : {}),
+      enableFileCheckpointing: true,
+      perTaskStopAffordance: true,
+      extraArgs: { 'replay-user-messages': null },
       permissionMode: preferences.permissionMode || 'default', includePartialMessages: true,
       ...(preferences.selectedModel ? { model: preferences.selectedModel } : {}),
       ...(preferences.effort ? { effort: preferences.effort } : {}),
@@ -274,6 +277,13 @@ class ChatService extends EventEmitter {
       ...(session.forkPending ? { forkSession: true } : {}),
       settingSources: ['user', 'project', 'local'],
       ...(session.remoteSessionId ? { resume: session.remoteSessionId } : {}),
+      // No opaque dialog is advertised until its exact payload/result has a renderer.
+      supportedDialogKinds: [],
+      onUserDialog: async request => {
+        run.transcript.notice('当前客户端暂不支持此确认流程：' + request.dialogKind + '。请在远端 Claude Code 中处理。', 'error');
+        this.changed(session, true);
+        throw new Error('Unsupported dialog kind: ' + request.dialogKind);
+      },
       onElicitation: (request, context) => this.requestElicitation(session, request, context),
       canUseTool: (name, input, context) => this.requestPermission(session, { name, input }, context),
       spawnClaudeCodeProcess: options => this.spawn(session, options, data => {
@@ -299,6 +309,9 @@ class ChatService extends EventEmitter {
   }
 
   consumeEvent(session, event, run) {
+    if (event.type === 'user' && event.uuid && !event.parent_tool_use_id &&
+        (typeof event.message?.content === 'string' || event.message?.content?.some(item => item.type === 'text')) &&
+        !run.message.checkpointId) run.message.checkpointId = event.uuid;
     if (event.session_id && ['system', 'assistant', 'result'].includes(event.type))
       session.remoteSessionId = event.session_id;
     if (event.type === 'system' && event.subtype === 'init') {
@@ -316,11 +329,16 @@ class ChatService extends EventEmitter {
     }
     if (event.type === 'result') session.usage = { totalCostUSD: event.total_cost_usd, models: event.modelUsage, lastTurn: event.usage, durationMs: event.duration_ms };
     if (event.type === 'system' && event.subtype === 'commands_changed' && session.capabilities) session.capabilities.commands = event.commands;
+    if (event.type === 'system' && event.subtype === 'background_tasks_changed') {
+      run.backgroundMembership = true;
+      session.tasks = (event.tasks || []).map(task => ({ ...task, id: task.task_id || task.id, status: task.status || 'running' }));
+    }
     if (event.type === 'system' && event.task_id) {
       session.tasks ||= [];
       let task = session.tasks.find(item => item.id === event.task_id);
-      if (!task) { task = { id: event.task_id }; session.tasks.push(task); }
-      Object.assign(task, { description: event.description || task.description, status: event.status || event.patch?.status || task.status || 'running',
+      if (!task && !run.backgroundMembership) { task = { id: event.task_id }; session.tasks.push(task); }
+      // Membership snapshots are authoritative; late edge events must not resurrect tasks.
+      if (task && !(event.run_id && task.run_id && event.run_id < task.run_id)) Object.assign(task, { run_id: event.run_id || task.run_id, description: event.description || task.description, status: event.status || event.patch?.status || task.status || 'running',
         summary: event.summary || task.summary, outputFile: event.output_file || task.outputFile, usage: event.usage || task.usage });
     }
     if (event.type === 'conversation_reset') session.remoteSessionId = event.new_conversation_id;

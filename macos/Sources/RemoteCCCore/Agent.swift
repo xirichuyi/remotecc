@@ -244,7 +244,11 @@ public final class AgentChannel: @unchecked Sendable {
 /// Owns one channel per server and restarts it on the next request after it closes.
 public final class AgentClient: @unchecked Sendable {
     private let lock = NSLock()
-    private var channels: [String: Task<AgentChannel, Error>] = [:]
+    private struct ChannelEntry {
+        let identity: UUID
+        let task: Task<AgentChannel, Error>
+    }
+    private var channels: [String: ChannelEntry] = [:]
     public let launcher: RemoteLauncher
     public let resources: ServerResources
     public var onFileChange: (@Sendable (ConnectionConfig, [String]) -> Void)?
@@ -254,22 +258,28 @@ public final class AgentClient: @unchecked Sendable {
     public func channel(_ config: ConnectionConfig) async throws -> AgentChannel {
         let key = config.key
         let task = lock.withLock { () -> Task<AgentChannel, Error> in
-            if let existing = channels[key] { return existing }
+            if let existing = channels[key] { return existing.task }
+            let identity = UUID()
             let task = Task<AgentChannel, Error> { [weak self] in
                 guard let self else { throw RemoteError("客户端已关闭") }
                 let channel = AgentChannel(launcher: self.launcher, config: config, resources: self.resources)
                 channel.onFileChange = { [weak self] directories in self?.onFileChange?(config, directories) }
-                channel.onClosed = { [weak self] in self?.forget(key) }
+                channel.onClosed = { [weak self] in self?.forget(key, identity: identity) }
                 do { try await channel.start(); return channel }
-                catch { self.forget(key); throw error }
+                catch { self.forget(key, identity: identity); throw error }
             }
-            channels[key] = task
+            channels[key] = ChannelEntry(identity: identity, task: task)
             return task
         }
         return try await task.value
     }
 
-    private func forget(_ key: String) { lock.withLock { channels[key] = nil } }
+    private func forget(_ key: String, identity: UUID) {
+        lock.withLock {
+            // An old channel's delayed EOF must not evict the already reconnected channel.
+            if channels[key]?.identity == identity { channels[key] = nil }
+        }
+    }
 
     public func call(_ config: ConnectionConfig, _ op: String, _ params: JSON, timeout: TimeInterval = 60) async throws -> JSON {
         try await channel(config).call(op, params, timeout: timeout)
@@ -287,7 +297,7 @@ public final class AgentClient: @unchecked Sendable {
     }
 
     public func close(_ config: ConnectionConfig) {
-        let task = lock.withLock { channels.removeValue(forKey: config.key) }
+        let task = lock.withLock { channels.removeValue(forKey: config.key)?.task }
         guard let task else { return }
         Task { (try? await task.value)?.close() }
     }

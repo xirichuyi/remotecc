@@ -22,6 +22,12 @@ struct FilePanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack {
+                Label("工作区", systemImage: "folder").font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button { model.showFiles = false } label: { Image(systemName: "xmark") }
+                    .buttonStyle(QuietButtonStyle()).help("关闭文件面板")
+            }.padding(.horizontal, 12).padding(.top, 8)
             Picker("", selection: $model.panel) {
                 ForEach(SidePanel.allCases) { panel in
                     if panel == .changes, let count = model.activeWorkspace?.gitStatus?.files.count, count > 0 { Text("变更 \(count)").tag(panel) }
@@ -30,16 +36,22 @@ struct FilePanel: View {
             }
             .pickerStyle(.segmented).labelsHidden().padding(8)
             Divider()
-            if let workspace = model.activeWorkspace, model.isConnected {
-                switch model.panel {
-                case .files: FileTreeView(workspace: workspace)
-                case .changes: ChangesView(workspace: workspace)
-                case .search: SearchView(workspace: workspace)
+            if let workspace = model.activeWorkspace {
+                if !model.isConnected {
+                    Label("连接已断开 · 保留上次加载的内容", systemImage: "network.slash")
+                        .font(.caption).foregroundStyle(.secondary).padding(8)
                 }
+                Group {
+                    switch model.panel {
+                    case .files: FileTreeView(workspace: workspace)
+                    case .changes: ChangesView(workspace: workspace)
+                    case .search: SearchView(workspace: workspace)
+                    }
+                }.disabled(!model.isConnected)
             } else {
                 ContentUnavailableView("未连接 SSH", systemImage: "network.slash").frame(maxHeight: .infinity)
             }
-        }
+        }.background(WorkbenchTheme.canvas)
     }
 }
 
@@ -149,10 +161,8 @@ struct FileTreeView: View {
 
     /// A conversation with messages keeps its context, so a new folder starts a new conversation.
     private func useFolder() {
-        guard let engine = model.engine, let root = workspace.root, let session = model.active else { return }
-        var config = session.config
-        config.directory = root
-        model.perform { model.select(try engine.create(config, preferences: session.preferences).id) }
+        guard let root = workspace.root else { return }
+        model.openProjectPicker(root)
     }
 }
 
@@ -394,7 +404,7 @@ struct EditorContent: View {
 
     var body: some View {
         Group {
-            if let error = tab.error {
+            if let error = tab.error, tab.preview == nil {
                 Text(error).foregroundStyle(.secondary).padding().textSelection(.enabled).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else if tab.isDiff {
                 if let text = tab.diffText {
@@ -403,7 +413,15 @@ struct EditorContent: View {
                     else { DiffView(rows: rows) }
                 } else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
             } else if let preview = tab.preview {
-                content(preview)
+                VStack(spacing: 0) {
+                    if let error = tab.error {
+                        Text("刷新失败，保留上次加载的内容：" + error)
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.orange.opacity(0.08))
+                    }
+                    content(preview)
+                }
             } else {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }

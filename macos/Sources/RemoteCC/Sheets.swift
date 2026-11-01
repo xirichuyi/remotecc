@@ -24,7 +24,7 @@ struct PreferencesSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("模型与会话设置").font(.headline).padding()
+            SheetHeading(title: "模型与会话设置", subtitle: "按当前任务调整模型与权限") { dismiss() }.disabled(saving).padding(24)
             if let capabilities { form(capabilities) }
             else if !loadError.isEmpty { Text(loadError).foregroundStyle(.red).padding().textSelection(.enabled) }
             else { ProgressView("读取远端能力…").padding().frame(maxWidth: .infinity) }
@@ -33,11 +33,11 @@ struct PreferencesSheet: View {
                 if !error.isEmpty { Text(error).font(.caption).foregroundStyle(.red).lineLimit(2) }
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("应用") { apply() }.keyboardShortcut(.defaultAction).disabled(capabilities == nil || saving)
+                Button("应用") { apply() }.buttonStyle(WorkbenchButtonStyle(prominent: true)).keyboardShortcut(.defaultAction).disabled(capabilities == nil || saving)
             }
             .padding()
         }
-        .frame(width: 520)
+        .frame(width: 520).background(WorkbenchTheme.canvas)
         .task { load(refresh: false) }
     }
 
@@ -182,6 +182,7 @@ struct SessionToolsSheet: View {
             if let session = model.active {
                 HStack {
                     Button("新对话") { dismiss(); model.newConversation() }
+                    Button("隔离工作区…") { dismiss(); model.showWorktree = true }
                     Button("分支当前对话") { model.perform { if let fork = try model.engine?.fork(session.id) { dismiss(); model.select(fork.id) } } }
                     Button("导出…") { model.exportConversation(session) }
                     Button(session.pinned == true ? "取消固定" : "固定") { model.perform { try model.engine?.setPinned(session.id, session.pinned != true) } }

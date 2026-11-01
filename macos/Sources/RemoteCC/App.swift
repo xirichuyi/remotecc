@@ -1,6 +1,8 @@
 #if canImport(SwiftUI)
 import SwiftUI
+import Network
 import AppKit
+import UserNotifications
 import RemoteCCCore
 
 @main
@@ -12,9 +14,11 @@ struct RemoteCCApp: App {
         WindowGroup("RemoteCC") {
             RootView()
                 .environmentObject(model)
+                .tint(WorkbenchTheme.accent)
                 .frame(minWidth: 1000, minHeight: 620)
                 .onAppear { delegate.model = model }
         }
+        .defaultSize(width: 1160, height: 760)
         .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(replacing: .newItem) {
@@ -31,21 +35,47 @@ struct RemoteCCApp: App {
                 Divider()
                 Button("模型与会话设置…") { model.showPreferences = true }
                 Button("连接 SSH…") { model.showConnect = true }
+                #if DEBUG
+                Divider()
+                Button("聊天交互预览…") { model.showChatGallery = true }
+                #endif
             }
         }
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     weak var model: AppModel?
+    private let networkMonitor = NWPathMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // A bare SwiftPM executable starts as a background process unless told otherwise.
+        UNUserNotificationCenter.current().delegate = self
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in await self?.model?.connections?.checkConnections() }
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            guard path.status == .satisfied else { return }
+            Task { @MainActor in await self?.model?.connections?.networkBecameAvailable() }
         }
+        networkMonitor.start(queue: DispatchQueue(label: "remotecc.network-path"))
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.model?.connections?.networkBecameAvailable() }
+        }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Task { @MainActor in model?.markActiveRead() }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let id = response.notification.request.content.userInfo["sessionId"] as? String {
+            Task { @MainActor in self.model?.select(id); NSApp.activate(ignoringOtherApps: true) }
+        }
+        completionHandler()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

@@ -24,7 +24,7 @@ const actions = {
   const service = new ChatService({ load: () => [], save() {} }, async () => query);
   service.closing = true;
   service.spawn = (_session, options, onError) => {
-    const child = spawn('claude', options.args, { cwd: request.directory, stdio: ['pipe', 'pipe', 'pipe'], signal: options.signal });
+    const child = spawn('claude', options.args, { cwd: request.directory, stdio: ['pipe', 'pipe', 'pipe'], env: options.env, signal: options.signal });
     child.stderr.setEncoding('utf8'); child.stderr.on('data', onError);
     return child;
   };

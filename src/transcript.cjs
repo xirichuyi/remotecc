@@ -57,6 +57,7 @@ class Transcript {
 
   assistant(event) {
     const sourceId = event.message.id;
+    if (event.isApiErrorMessage || event.error) this.message.error = event.message.content.filter(b => b.type === 'text').map(b => b.text).join("\n") || event.error || "远端请求失败";
     // Final assistant messages replace their streamed text instead of appending it twice.
     const texts = event.message.content.filter(block => block.type === 'text');
     if (texts.length) {
@@ -123,9 +124,9 @@ class Transcript {
   }
 
   system(event) {
-    delete this.message.activity;
     if (event.subtype === 'local_command_output') this.addBlock({ type: 'text', text: event.content }, event.uuid);
     if (event.subtype === 'compact_boundary') {
+      delete this.message.activity;
       const { pre_tokens: before, post_tokens: after, trigger } = event.compact_metadata || {};
       this.notice((trigger === 'auto' ? '上下文已自动压缩' : '上下文已压缩') + (before ? `（${before}${after ? ' → ' + after : ''} tokens）` : ''));
     }
@@ -137,6 +138,16 @@ class Transcript {
   }
 
   consume(event) {
+    if (event.type === 'rate_limit_event') {
+      const info = event.rate_limit_info || {};
+      if (info.status === 'allowed') { if (['rate_limit', 'credits'].includes(this.message.serviceIssue?.kind)) delete this.message.serviceIssue; }
+      else this.message.serviceIssue = {
+        kind: info.errorCode === 'credits_required' ? 'credits' : 'rate_limit',
+        title: info.errorCode === 'credits_required' ? '账户可用额度已耗尽' : info.status === 'rejected' ? '已达到使用限制' : '即将达到使用限制',
+        detail: info.errorCode === 'credits_required' ? '请在远端使用的账户中检查额度，恢复后再继续。' : '等待服务端恢复；不会自动重复提交你的任务。',
+        resetsAt: info.resetsAt, status: info.status
+      };
+    }
     if (event.parent_tool_use_id) { this.subagent(event); return; }
     if (event.type === 'stream_event') { delete this.message.activity; this.stream(event.event); }
     if (event.type === 'assistant') this.assistant(event);
@@ -150,7 +161,8 @@ class Transcript {
       const block = this.message.blocks.find(item => item.id === event.preceding_tool_use_ids?.at(-1));
       if (block) block.summary = event.summary;
     }
-    if (event.type === 'auth_status' && event.error) this.notice('认证失败：' + event.error, 'error');
+    if (event.type === 'auth_status' && event.error) this.message.serviceIssue = { kind: 'auth', title: '远端 Claude 认证失败', detail: String(event.error) };
+    if (event.type === 'auth_status' && !event.error && !event.isAuthenticating && this.message.serviceIssue?.kind === 'auth') delete this.message.serviceIssue;
     if (event.type === 'conversation_reset') this.notice('Claude 的上下文已在此处重置，以上内容不再属于当前对话。', 'boundary');
     if (event.type === 'result') {
       if (event.is_error) this.message.error = event.result || event.errors?.join('\n') || '远端 Claude 返回错误';

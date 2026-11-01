@@ -104,3 +104,14 @@ test('list cursor uses a stable snapshot while new sessions arrive', async () =>
     assert.equal((await f.call({operation:'list'})).total,206);
   } finally {fs.rmSync(f.root,{recursive:true,force:true});}
 });
+
+test('history preserves real API failure markers through agent and transcript conversion', async () => {
+  const f = fixture();
+  try {
+    const row = { type: 'assistant', uuid: randomUUID(), parentUuid: null, cwd: '/tmp/test', isApiErrorMessage: true, error: 'rate_limit', message: { content: [{ type: 'text', text: 'Usage limit reached' }] } };
+    fs.writeFileSync(f.file, JSON.stringify(row) + '\n');
+    const page = await f.call({ operation: 'messages', reference: f.reference });
+    assert.equal(page.records[0].isApiErrorMessage, true);
+    assert.equal(historyMessages(page.records)[0].error, 'Usage limit reached');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});

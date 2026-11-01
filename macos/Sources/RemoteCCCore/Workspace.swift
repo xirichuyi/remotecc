@@ -68,17 +68,31 @@ public final class Workspace {
             guard current == generation else { return }
             if root != listing.path { expanded = []; directories = [:]; root = listing.path }
             directories[listing.path] = listing
-            for directory in expanded {
-                do { directories[directory] = try await files.list(config, directory, hidden: showHidden, force: force) }
-                catch { expanded.remove(directory) }
+            rebuild() // Show the root immediately, before refreshing expanded children.
+            let files = self.files, config = self.config, hidden = showHidden
+            var pending = Array(expanded).makeIterator()
+            var failed = false
+            await withTaskGroup(of: (String, DirectoryListing?).self) { group in
+                func enqueue(_ directory: String) {
+                    group.addTask { (directory, try? await files.list(config, directory, hidden: hidden, force: force)) }
+                }
+                for _ in 0..<4 { if let directory = pending.next() { enqueue(directory) } }
+                for await (directory, listing) in group {
+                    guard current == generation else { group.cancelAll(); continue }
+                    if let listing { directories[directory] = listing } else { failed = true }
+                    if let directory = pending.next() { enqueue(directory) }
+                }
             }
             guard current == generation else { return }
             rebuild()
+            if failed { footer += " · 部分目录刷新失败，保留上次内容"; changed() }
             await syncWatches()
             await refreshGit()
         } catch {
             guard current == generation else { return }
-            self.error = error.localizedDescription; footer = "读取失败"; rows = []; changed()
+            self.error = error.localizedDescription
+            footer = rows.isEmpty ? "读取失败" : "刷新失败 · 显示上次加载的目录"
+            changed()
         }
     }
 
@@ -144,7 +158,7 @@ public final class Workspace {
 
     /// A push from the server. Clean tabs follow it; tabs with unsaved edits are flagged instead.
     public func filesChanged(_ changedDirectories: [String]) async {
-        files.invalidate()
+        files.invalidate(config)
         for directory in changedDirectories where directories[directory] != nil {
             if let listing = try? await files.list(config, directory, hidden: showHidden, force: true) { directories[directory] = listing }
         }
@@ -221,7 +235,7 @@ public final class Workspace {
 
     public func createEntry(in directory: String, name: String, folder: Bool) async throws {
         let created = try await files.run(config, "create", ["directory": .string(directory), "name": .string(name), "folder": .bool(folder)]).decode(FileEntry.self)
-        files.invalidate()
+        files.invalidate(config)
         if directory != root { expanded.insert(directory) }
         await reload(force: true)
         if !folder { await open(created.path) }
@@ -229,13 +243,13 @@ public final class Workspace {
 
     public func rename(_ entry: FileEntry, to name: String) async throws {
         _ = try await files.run(config, "rename", ["path": .string(entry.path), "name": .string(name)])
-        files.invalidate()
+        files.invalidate(config)
         await reload(force: true)
     }
 
     public func remove(_ entry: FileEntry) async throws {
         _ = try await files.run(config, "remove", ["path": .string(entry.path), "recursive": .bool(entry.directory)])
-        files.invalidate()
+        files.invalidate(config)
         await reload(force: true)
     }
 

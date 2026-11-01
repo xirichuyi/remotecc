@@ -13,6 +13,8 @@ const { RemoteFiles } = require('../src/files.cjs');
 const config = { host: 'test', directory: '~' };
 function fixture(extraEnv = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'rcc-agent-'));
+  // Keep login-shell fixtures on this test process's Node, not a host's legacy default.
+  if (!extraEnv.PATH) fs.writeFileSync(path.join(home, '.bash_profile'), 'export PATH=' + require('../src/remote.cjs').shellQuote(path.dirname(process.execPath)) + ':$PATH\n');
   const spawned = [];
   const connections = {
     spawn(_config, command) {
@@ -42,7 +44,7 @@ test('agent installs itself once, ignores login-shell noise, and multiplexes req
     const before = launches();
     const results = await Promise.all(Array.from({ length: 20 }, () => f.client.call(config, 'file', { operation: 'list', base: '~', path: '~', hidden: true })));
     assert.equal(launches(), before);
-    assert.deepEqual(results[0].entries.map(entry => entry.name), ['.hidden', '.local', '.profile', 'note.txt']);
+    assert.deepEqual(results[0].entries.map(entry => entry.name), ['.hidden', '.local', '.bash_profile', '.profile', 'note.txt']);
     await assert.rejects(f.client.call(config, 'file', { operation: 'list', path: '/definitely/missing' }), /ENOENT/);
   } finally { f.close(); }
 });
@@ -119,8 +121,8 @@ test('task: starts once, streams deltas, answers commands immediately, survives 
     const bundle = workerBundle(`
       const fs=require('fs'),path=require('path');const folder=process.argv[2];let version=0;
       const write=(status,text,done=false)=>{fs.writeFileSync(path.join(folder,'state.json.tmp'),JSON.stringify({version:++version,done,resident:true,status,permissions:[],message:{id:'reply',blocks:[{type:'text',text}]}}));fs.renameSync(path.join(folder,'state.json.tmp'),path.join(folder,'state.json'));};
-      fs.appendFileSync(path.join(folder,'runs'),'x');write('working','he');setTimeout(()=>write('working','hello'),50);
-      setInterval(()=>{for(const name of fs.readdirSync(path.join(folder,'commands'))){if(!name.endsWith('.json'))continue;const file=path.join(folder,'commands',name);const c=JSON.parse(fs.readFileSync(file));fs.writeFileSync(file+'.result',JSON.stringify({ok:true,value:c.value}));fs.renameSync(file,file+'.done');if(c.value==='finish')write('idle','hello world',true);}},20);
+      fs.appendFileSync(path.join(folder,'runs'),'x');write('working','he');
+      setInterval(()=>{for(const name of fs.readdirSync(path.join(folder,'commands'))){if(!name.endsWith('.json'))continue;const file=path.join(folder,'commands',name);const c=JSON.parse(fs.readFileSync(file));fs.writeFileSync(file+'.result',JSON.stringify({ok:true,value:c.value}));fs.renameSync(file,file+'.done');if(c.value==='stream')write('working','hello');if(c.value==='finish')write('idle','hello world',true);}},20);
     `);
     assert.deepEqual(await f.client.call(config, 'task', { operation: 'installed', digest: bundle.digest }), { installed: false });
     await f.client.call(config, 'task', { operation: 'install', ...bundle });
@@ -130,6 +132,8 @@ test('task: starts once, streams deltas, answers commands immediately, survives 
     const packets = [];
     let ended = false;
     await f.client.subscribe(config, { taskId }, packet => packets.push(packet), () => { ended = true; });
+    await until(() => packets.length > 0);
+    await f.client.call(config, 'task', { operation: 'command', taskId, commandId: randomUUID(), command: { value: 'stream' }, wait: true });
     await until(() => packets.some(packet => packet.delta));
     assert.deepEqual(packets.find(packet => packet.delta).patches.find(patch => 'append' in patch).append, 'llo');
 

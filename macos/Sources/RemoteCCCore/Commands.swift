@@ -58,6 +58,11 @@ public struct CommandOption: Hashable, Sendable, Identifiable {
     public var label: String
     public var description: String?
     public var id: String { value }
+    public init(value: String, label: String, description: String? = nil) {
+        self.value = value
+        self.label = label
+        self.description = description
+    }
 }
 
 /// A slash command the client can drive with a native picker.

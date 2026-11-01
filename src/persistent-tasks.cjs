@@ -8,7 +8,7 @@ const { agentFor } = require('./agent-client.cjs');
 
 function taskBundle() {
   const files = {};
-  for (const name of ['task-worker.cjs', 'task-inspect.cjs', 'chat-service.cjs', 'remote.cjs', 'transcript.cjs', 'capabilities.cjs', 'interaction-schema.js', 'session-input.cjs'])
+  for (const name of ['checkpoint-control.cjs', 'task-worker.cjs', 'task-inspect.cjs', 'chat-service.cjs', 'remote.cjs', 'transcript.cjs', 'capabilities.cjs', 'interaction-schema.js', 'session-input.cjs'])
     files[name] = fs.readFileSync(path.join(__dirname, name), 'utf8');
   files['sdk.mjs'] = fs.readFileSync(require.resolve('@anthropic-ai/claude-agent-sdk'), 'utf8');
   const data = Buffer.from(JSON.stringify(files));
